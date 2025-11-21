@@ -1,0 +1,64 @@
+model:
+  base_learning_rate: 5.0e-05
+  adjust_learning_rate: false
+  find_unused_parameters: true
+  gradient_clip_algorithm: norm
+  precision: bf16
+  grad_clip: 1.0
+  grad_acc_steps: 2
+  target: models.second_stage.fm_model_repa_e2e_kl.ModelREPA
+  params:
+    warmup_steps: 5000
+    min_lr_multiplier: 0.1
+    enc_scale: 4
+    adjust_lr_to_batch_size: false
+    add_projector: true
+    add_norm: false
+    latent_dim: 1024
+    sr_latents:
+      - 8
+    tokenizer_config:
+      folder: /e/project1/multiscale-wm/mittal3/orbis_logs/logs_tok/2025-08-20T21-17-35_stage1_kl_192x336_DLC101600_dec_only
+      ckpt_path: checkpoints/last.ckpt
+    generator_config:
+      target: networks.DiT.dit_sr_bn.STDiT
+      params:
+        max_num_frames: 64
+        hidden_size: 768 #768
+        depth: 24
+        num_heads: 16
+        mlp_ratio: 4
+        patch_size: 1
+        input_size:
+        - 12
+        - 21
+        in_channels: 16
+        dropout: 0.0
+        drop_ctx_rate: 0.0
+        ctx_noise_aug_prob: 0.0
+        ctx_noise_aug_ratio: 0.0
+data:
+  target: data.datamodule.DataModuleFromConfig
+  params:
+    batch_size: 4
+    num_workers: 4
+    train:
+      target: data.wrapped_datasets.CachedMultiHDF5DatasetMultiFrame
+      params:
+        hdf5_paths_file: /e/project1/multiscale-wm/farid1/data/train_640x360_debug.txt
+        size: [192, 336]
+        num_frames: 8
+        caching_path: /e/project1/multiscale-wm/farid1/data/cached_latents/dinov3l
+        cache_mode: read
+        split: train
+        model_cfg_path: data/latent_cache/dinov3l.json
+    validation:
+      target: data.wrapped_datasets.CachedMultiHDF5DatasetMultiFrame
+      params:
+        hdf5_paths_file: /e/project1/multiscale-wm/farid1/data/val_640x360.txt
+        size: [192, 336]
+        num_frames: 8
+        caching_path: /e/project1/multiscale-wm/farid1/data/cached_latents/dinov3l
+        cache_mode: read
+        split: val
+        model_cfg_path: data/latent_cache/dinov3l.json

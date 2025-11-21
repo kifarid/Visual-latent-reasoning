@@ -1,0 +1,81 @@
+model:
+  base_learning_rate: 5.0e-05
+  adjust_learning_rate: false
+  find_unused_parameters: true
+  gradient_clip_algorithm: norm
+  precision: bf16-mixed
+  grad_clip: 1.0
+  grad_acc_steps: 4
+  target: models.second_stage.fm_model_repa.ModelREPAIFTeacher
+  params:
+    warmup_steps: 5000
+    min_lr_multiplier: 0.1
+    enc_scale: 4
+    adjust_lr_to_batch_size: false
+    add_projector: true
+    add_norm: false
+    sr_loss_weight: 0.0
+    latent_dim: 1024
+    sr_latents:
+      - 6
+    tokenizer_config:
+      folder: /p/scratch/nxtaim-1/mittal3/logs/orbis/logs_tok/2025-08-20T21-17-41_stage1_vq_if_192x336_DLC101602_mixed_ft_dec_only
+      ckpt_path: checkpoints/epoch-26_rfid_8_9.ckpt
+    generator_config:
+      target: networks.DiT.dit_sr.STDiT
+      params:
+        max_num_frames: 64
+        hidden_size: 768 #768
+        depth: 12
+        num_heads: 12
+        patch_size: 1
+        mlp_ratio: 4
+        input_size:
+        - 12
+        - 21
+        in_channels: 16
+        dropout: 0.0
+        ctx_noise_aug_ratio: 0.1
+        ctx_noise_aug_prob: 0.5
+        drop_ctx_rate: 0.1
+
+    teacher_config:
+      target: models.second_stage.teacher_model.DistillationTeacher
+      params:
+        model_id: facebook/dinov3-vitl16-pretrain-lvd1689m
+        revision: main
+        device: cuda
+        dtype: bf16
+        reg_tokens: 4
+        class_tokens: 1
+        patch_size: 16
+data:
+  target: data.datamodule.DataModuleFromConfig
+  params:
+    batch_size: 8
+    num_workers: 4
+    train:
+    - target: data.custom_multiframe.MultiHDF5DatasetMultiFrameRandomizeFrameRate
+      params:
+        hdf5_paths_file: /p/scratch/nxtaim-1/users/galesso1/datasets/bdd_h5/bdd_day_clear_12k_640x360.txt
+        size:
+        - 192
+        - 336
+        num_frames: 6
+        stored_data_frame_rate: 5
+        frame_rates_and_weights:
+        - - 5
+          - 1
+        aug: random_shift
+        scale_min: 0.15
+        scale_max: 0.5
+    validation:
+      target: data.custom_multiframe.MultiHDF5DatasetMultiFrameFromJSONFrameRateWrapper
+      params:
+        samples_json: /p/scratch/nxtaim-1/mousakhan1/data/bdd_val/selected_validation_next_frame.json
+        size:
+        - 192
+        - 336
+        num_frames: 6
+        stored_data_frame_rate: 5
+        frame_rate: 5

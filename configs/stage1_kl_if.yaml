@@ -1,0 +1,82 @@
+model:
+  base_learning_rate: 8.0e-07
+  adjust_learning_rate: true
+  static_graph: true
+  target: models.first_stage.autoencoder.AutoencoderKLIF
+  params:
+    monitor: val/rec_loss
+    grad_acc_steps: 1
+    min_lr_multiplier: 0.1
+    only_decoder: false
+    scale_equivariance: [[2], [2]]
+    distill_model_type: VIT_DINOv2
+    encoder_config:
+      target: networks.tokenizer.ae.Encoder
+      params:
+        e_dim: 4
+        patch_size: 8
+        double_z: false
+        z_channels: 768
+        resolution: [256, 256]
+        in_channels: 3
+        out_ch: 3
+        ch: 128
+        ch_mult:
+        - 1
+        - 2
+        - 4
+        - 4
+        num_res_blocks: 2
+        attn_resolutions: []
+        dropout: 0.0
+    decoder_config:
+      target: networks.tokenizer.ae.Decoder
+      params:
+        e_dim: 8
+        z_channels: 768
+        resolution: [256, 256]
+        in_channels: 3
+        out_ch: 3
+        ch: 128
+        ch_mult:
+        - 1
+        - 2
+        - 4
+        - 4
+        num_res_blocks: 2
+        attn_resolutions: []
+        dropout: 0.0
+    loss_config:
+      target: modules.klloss.LPIPSWithDiscriminator
+      params:
+        disc_conditional: false
+        disc_in_channels: 3
+        distill_loss_weight: 2.0
+        disc_start: 10000
+        disc_weight: 0.1
+        adaptive_disc_weight: true
+        perceptual_weight: 1.0
+        kl_weight: 1.0e-06
+        se_weight: 0.25
+        warmup_steps: 5000
+        beta_1: 0.5
+        beta_2: 0.9
+
+data:
+  target: data.datamodule.DataModuleFromConfig
+  params:
+    batch_size: 8
+    num_workers: 14
+    train:
+      target: data.custom.MultiHDF5Dataset
+      params:
+        hdf5_paths_file: /work/dlcsmall2/mittal-bdd-data/tokenizer_data/L4_500k/train.txt
+        size: 256
+        aug: random_resize_center
+        scale_min: 0.25
+        scale_max: 0.75
+    validation:
+      target: data.custom.MultiHDF5Dataset
+      params:
+        hdf5_paths_file: /work/dlcsmall2/mittal-bdd-data/tokenizer_data/L4_500k/val.txt
+        size: 256

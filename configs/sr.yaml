@@ -1,0 +1,58 @@
+model:
+  base_learning_rate: 5.0e-05
+  adjust_learning_rate: false
+  find_unused_parameters: true
+  gradient_clip_algorithm: norm
+  precision: bf16
+  grad_clip: 1.0
+  grad_acc_steps: 4
+  target: models.second_stage.fm_model_sr.ModelSRIF
+  params:
+    warmup_steps: 5000
+    min_lr_multiplier: 0.1
+    enc_scale: 4
+    enc_scale_dino: 4
+    adjust_lr_to_batch_size: false
+    sr_latents:
+      - 8
+    tokenizer_config:
+      folder: $TK_WORK_DIR/2025-04-08T15-23-09_custom_f16_16384_dim16_L5_sepEnc_dinox2_0_vq_only_wo_adv_lmbgpu20_SE2_mixed_adv_dec_only
+      ckpt_path: checkpoints/epoch-3.ckpt
+    generator_config:
+      target: networks.DiT.dit_sr.STDiT
+      params:
+        max_num_frames: 64
+        hidden_size: 16 #768
+        depth: 24
+        num_heads: 16
+        mlp_ratio: 4
+        patch_size: 2
+        input_size:
+        - 22
+        - 40
+        in_channels: 32
+        dropout: 0.0
+        drop_ctx_rate: 0.0
+        ctx_noise_aug_prob: 0.0
+        ctx_noise_aug_ratio: 0.0
+data:
+  target: data.datamodule.DataModuleFromConfig
+  params:
+    batch_size: 2
+    num_workers: 4
+    train:
+    - target: data.custom_multiframe.MultiHDF5DatasetMultiFrame
+      params:
+        hdf5_paths_file: /work/dlcsmall2/galessos-bdd_ssd2/h5/train_bdd_day_clear_12k_5Hz_videos_640x360.txt
+        size:
+        - 352
+        - 640
+        num_frames: 8
+    validation:
+      target: data.custom_multiframe.MultiHDF5DatasetMultiFrameFromJSON
+      params:
+        samples_json: /work/dlcsmall2/galessos-bdd_ssd2/h5/selected_validation_next_frame.json
+        size:
+        - 352
+        - 640
+        num_frames: 8

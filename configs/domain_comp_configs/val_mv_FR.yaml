@@ -1,0 +1,29 @@
+data:
+  target: data.datamodule.DataModuleFromConfig
+  params:
+    batch_size: 5
+    num_workers: 4
+    train:
+      target: data.custom_mv.MultiHDF5DatasetMultiFrameMultiViewBiased
+      params:
+        hdf5_paths_file: /p/scratch/nxtaim-1/farid1/orbis/data/mv_h5_paths.txt
+        size:
+        - 256
+        - 256
+        num_frames: 8
+        views:
+        - CAM_F0
+        - CAM_B0
+        frame_rate_multiplier: 0.5
+    validation:
+      target: data.custom_mv.MultiHDF5DatasetMultiFrameMultiViewBiased
+      params:
+        hdf5_paths_file: /p/scratch/nxtaim-1/farid1/orbis/data/mv_h5_paths_val.txt
+        size:
+        - 256
+        - 256
+        num_frames: 8
+        views:
+        - CAM_F0
+        - CAM_B0
+        frame_rate_multiplier: 0.5

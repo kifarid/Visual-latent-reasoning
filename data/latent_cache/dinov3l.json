@@ -1,0 +1,25 @@
+{
+  "model": {
+    "modality": "image",
+    "model_id": "facebook/dinov3-vitl16-pretrain-lvd1689m",
+    "revision": "main",
+
+    "device": "cuda",
+    "dtype": "bf16",
+    "reg_toks": 4,
+    "class_toks": 1,
+
+    "layer": {
+      "type": "head",
+      "spec": "",
+      "keep_tokens": true
+    },
+
+    "pool": "tokens_mean",
+    "patch_size": 16
+  },
+
+  "runtime": {
+    "offline": false
+  }
+}

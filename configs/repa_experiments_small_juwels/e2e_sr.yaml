@@ -1,0 +1,93 @@
+model:
+  base_learning_rate: 5e-05
+  adjust_learning_rate: false
+  find_unused_parameters: true
+  #gradient_clip_algorithm: norm
+  precision: 32 #bf16-mixed
+  #grad_clip: 0.5
+  target: models.second_stage.fm_model_e2e_kl_repa_reg.ModelREPATeacher
+  params:
+    warmup_steps: 10000
+    sr_loss_weight: 1.0
+    sr_yol_loss_weight: 0.1
+    min_lr_multiplier: 0.1
+    grad_acc_steps: 4
+    grad_acc_steps_ae: 4
+    ae_loss_weight: 0.01
+    enc_scale: 1.0
+    adjust_lr_to_batch_size: false
+    add_projector: true
+    loss_type: cos_sim
+    add_norm: false
+    latent_dim: 1024
+    ctx_noise_exp: 1.0
+    ctx_noise_prob: 0.6
+    nan_debug: false
+    dino_predictor_only: true
+    sr_latents:
+      - 6
+    tokenizer_config:
+      folder: /p/scratch/nxtaim-1/farid1/orbis/logs_tk/tk/pseudo_tok
+      ckpt_path: #checkpoints/last.ckpt
+    generator_config:
+      target: networks.DiT.recursive_dit_bn.FlexDiT
+      params:
+        max_num_frames: 64
+        hidden_size: 792 #768
+        depth: 12 #24
+        num_heads: 12
+        patch_size: 1
+        mlp_ratio: 4
+        input_size:
+          - 11
+          - 20
+        in_channels: 128
+        dropout: 0.0
+        drop_ctx_rate: 0.0
+        ctx_noise_aug_prob: 0.0
+        ctx_noise_aug_ratio: 0.0
+        main_block_type: t
+        num_spatial_per_main: 1
+        num_temporal_per_main: 0
+        num_reg_tokens: 8
+        causal_time_attn: false
+    teacher_config:
+      target: models.second_stage.teacher_model.DistillationTeacher
+      params:
+        model_id: facebook/dinov3-vitl16-pretrain-lvd1689m
+        revision: main
+        device: cuda
+        dtype: bf16
+        reg_tokens: 4
+        class_tokens: 1
+        patch_size: 16
+data:
+  target: data.datamodule.DataModuleFromConfig
+  params:
+    batch_size: 2
+    num_workers: 16
+    train:
+    - target: data.custom_multiframe.MultiHDF5DatasetMultiFrameRandomizeFrameRate
+      params:
+        hdf5_paths_file: /p/scratch/nxtaim-1/users/galesso1/datasets/bdd_h5/bdd_day_clear_12k_640x360.txt
+        size:
+        - 176
+        - 320
+        num_frames: 5
+        stored_data_frame_rate: 5
+        frame_rates_and_weights:
+        - - 5
+          - 1
+        aug: random_shift
+        scale_min: 0.15
+        scale_max: 0.5
+    validation:
+      target: data.custom_multiframe.MultiHDF5DatasetMultiFrameFromJSON
+      params:
+        samples_json: /p/scratch/nxtaim-1/mousakhan1/data/bdd_val/selected_validation_next_frame.json
+        size:
+        - 176
+        - 320
+        num_frames: 5
+        stored_data_frame_rate: 5
+        frame_rate: 5

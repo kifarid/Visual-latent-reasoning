@@ -1,0 +1,79 @@
+model:
+  base_learning_rate: 5.0e-05
+  adjust_learning_rate: false
+  find_unused_parameters: true
+  gradient_clip_algorithm: norm
+  precision: bf16
+  grad_clip: 1.0
+  grad_acc_steps: 2
+  target: models.second_stage.fm_model_repa.ModelREPAIFTeacher
+  params:
+    warmup_steps: 5000
+    min_lr_multiplier: 0.1
+    enc_scale: 4
+    adjust_lr_to_batch_size: false
+    add_projector: true
+    add_norm: false
+    sr_loss_weight: 0.0
+    latent_dim: 1024
+    sr_latents:
+      - 8
+    tokenizer_config:
+      folder: $TK_WORK_DIR/2025-04-08T15-23-09_custom_f16_16384_dim16_L5_sepEnc_dinox2_0_vq_only_wo_adv_lmbgpu20_SE2_mixed_adv_dec_only
+      ckpt_path: checkpoints/epoch-3.ckpt
+    generator_config:
+      target: networks.DiT.recursive_dit.FlexDiT
+      params:
+        max_num_frames: 64
+        hidden_size: 1056
+        depth: 12
+        num_heads: 16
+        mlp_ratio: 4
+        patch_size: 1
+        input_size:
+        - 12
+        - 21
+        in_channels: 32
+        dropout: 0.0
+        drop_ctx_rate: 0.0
+        ctx_noise_aug_prob: 0.0
+        ctx_noise_aug_ratio: 0.0
+        main_block_type: t
+        num_spatial_per_main: 1
+        num_temporal_per_main: 1
+        num_reg_tokens: 16
+        causal_time_attn: false
+    
+    teacher_config:
+      target: models.second_stage.teacher_model.DistillationTeacher
+      params:
+        model_id: facebook/dinov3-vitl16-pretrain-lvd1689m
+        revision: main
+        device: cuda
+        dtype: bf16
+        reg_tokens: 4
+        class_tokens: 1
+        patch_size: 16
+
+data:
+  target: data.datamodule.DataModuleFromConfig
+  params:
+    batch_size: 4 #6 worked
+    num_workers: 6
+    shuffle_val: true
+    train:
+      target: data.custom_multiframe.MultiHDF5DatasetMultiFrame
+      params:
+        hdf5_paths_file: /work/dlcsmall1/faridk-datasets_ssd/bdd/train/train_bdd_day_clear_12k_5Hz_videos_640x360.txt
+        size:
+        - 192
+        - 336
+        num_frames: 6
+    validation:
+      target: data.custom_multiframe.MultiHDF5DatasetMultiFrameFromJSON
+      params:
+        samples_json: /work/dlcsmall1/faridk-datasets_ssd/bdd/val/selected_validation_next_frame.json
+        size:
+        - 192
+        - 336
+        num_frames: 6

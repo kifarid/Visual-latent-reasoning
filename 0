@@ -1,0 +1,19 @@
+resolvers       | caches | path '/home/faridk/.texlive2021/texmf-var' created
+mtx-context     | warning: no (local) file './=', proceeding
+
+resolvers       | formats | executing runner 'run luatex format': /usr/bin/luatex --jobname="=" --socket --shell-escape --fmt=/var/lib/texmf/luatex-cache/context/b47c3d3cee7cb6c86268d0595268c442/formats/luatex/cont-en.fmt --lua=/var/lib/texmf/luatex-cache/context/b47c3d3cee7cb6c86268d0595268c442/formats/luatex/cont-en.lui  --c:currentrun=1 --c:fulljobname="./=" --c:input="./=" --c:kindofrun=1 --c:maxnofruns=9 --c:texmfbinpath="/usr/bin"
+This is LuaTeX, Version 1.14.0 (TeX Live 2022/dev/Debian) 
+ system commands enabled.
+**
+
+
+tex error       > tex error on line 0 in file : ! I can't find file `target'.
+
+
+<*>         target 
+                = code[:,-self.num_pred_frames:]
+
+
+<empty file>
+
+mtx-context     | fatal error: return code: 256

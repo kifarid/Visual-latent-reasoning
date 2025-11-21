@@ -1,0 +1,64 @@
+model:
+  base_learning_rate: 5.0e-05
+  adjust_learning_rate: false
+  find_unused_parameters: true
+  gradient_clip_algorithm: value
+  precision: 16-mixed
+  grad_clip: 1.0
+  grad_acc_steps: 1
+  target: models.second_stage.fm_model.Model
+  params:
+    warmup_steps: 5000
+    min_lr_multiplier: 0.1
+    enc_scale: 4
+    adjust_lr_to_batch_size: false
+    tokenizer_config:
+      folder: $TK_WORK_DIR/2025-05-11T00-51-23_custom_f16_16384_dim16_L4_no_IF_no_dino_no_adv_vq_only_DLC11476864_ft_mixed_dec_only
+      ckpt_path: checkpoints/new.ckpt
+    generator_config:
+      target: networks.DiT.dit.STDiT
+      params:
+        max_num_frames: 64
+        hidden_size: 768
+        depth: 24
+        num_heads: 16
+        mlp_ratio: 4
+        input_size:
+        - 16
+        - 16
+        patch_size: 1
+        in_channels: 16
+        dropout: 0.0
+        ctx_noise_aug_ratio: 0.1
+        ctx_noise_aug_prob: 0.5
+        drop_ctx: 0.5
+data:
+  target: data.datamodule.DataModuleFromConfig
+  params:
+    batch_size: 4
+    num_workers: 4
+    train:
+    - target: data.custom_multiframe.MultiHDF5DatasetMultiFrameRandomizeFrameRate
+      params:
+        hdf5_paths_file: /work/dlcsmall2/galessos-bdd_ssd2/h5/train_bdd_day_clear_12k_5Hz_videos_640x360.txt
+        size:
+        - 256
+        - 256
+        num_frames: 6
+        stored_data_frame_rate: 5
+        frame_rates_and_weights:
+        - - 5
+          - 1
+        aug: random_shift
+        scale_min: 0.15
+        scale_max: 0.5
+    validation:
+      target: data.custom_multiframe.MultiHDF5DatasetMultiFrameFromJSONFrameRateWrapper
+      params:
+        samples_json: /work/dlcsmall2/galessos-bdd_ssd2/h5/selected_validation_next_frame.json
+        size:
+        - 256
+        - 256
+        num_frames: 6
+        stored_data_frame_rate: 5
+        frame_rate: 5

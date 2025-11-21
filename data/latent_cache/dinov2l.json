@@ -1,0 +1,25 @@
+{
+  "model": {
+    "modality": "image",
+    "model_id": "facebook/dinov2-large",
+    "revision": "main",
+
+    "device": "cuda",
+    "dtype": "bf16",
+    "reg_toks": 0,
+    "class_toks": 1,
+
+    "layer": {
+      "type": "head",
+      "spec": "",
+      "keep_tokens": true
+    },
+
+    "pool": "tokens_mean",
+    "patch_size": 14
+  },
+
+  "runtime": {
+    "offline": false
+  }
+}

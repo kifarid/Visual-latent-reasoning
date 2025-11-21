@@ -1,0 +1,65 @@
+model:
+  base_learning_rate: 5.0e-05
+  adjust_learning_rate: false
+  find_unused_parameters: true
+  gradient_clip_algorithm: norm
+  precision: bf16-mixed
+  grad_clip: 1.0
+  grad_acc_steps: 1
+  target: models.second_stage.fm_model_repa.ModelREPA
+  params:
+    warmup_steps: 5000
+    min_lr_multiplier: 0.1
+    enc_scale: 4
+    adjust_lr_to_batch_size: false
+    add_projector: true
+    add_norm: false
+    latent_dim: 1024
+    sr_latents:
+      - 10
+    tokenizer_config:
+      folder: $TK_WORK_DIR/tk/2025-08-20T21-18-10_stage1_vq_192x336_DLC101603_mixed_ft_dec_only
+      ckpt_path: checkpoints/epoch-22.ckpt
+    generator_config:
+      target: networks.DiT.dit_sr.STDiT
+      params:
+        max_num_frames: 64
+        hidden_size: 768 #768
+        depth: 24
+        num_heads: 16
+        patch_size: 1
+        mlp_ratio: 4
+        input_size:
+        - 12
+        - 21
+        in_channels: 16
+        dropout: 0.0
+        drop_ctx_rate: 0.0
+        ctx_noise_aug_ratio: 0.1
+        ctx_noise_aug_prob: 0.5
+data:
+  target: data.datamodule.DataModuleFromConfig
+  params:
+    batch_size: 8
+    num_workers: 4
+    shuffle_val: true
+    train:
+      target: data.vds_minimal_dataset.MinimalVDSDataset
+      params:
+        vds_path: /work/dlclarge2/faridk-diff_force/datasets/Covla/h5/vds_splits_minimal.h5
+        split: train
+        num_frames: 8
+        size: [192, 336]
+        h5_cache_nbytes: 268435456
+        h5_cache_nslots: 4096
+        h5_cache_w0: 0.9
+    validation:
+      target: data.vds_minimal_dataset.MinimalVDSDataset
+      params:
+        vds_path: /work/dlclarge2/faridk-diff_force/datasets/Covla/h5/vds_splits_minimal.h5
+        split: val
+        num_frames: 8
+        size: [192, 336]
+        h5_cache_nbytes: 268435456
+        h5_cache_nslots: 4096
+        h5_cache_w0: 0.9

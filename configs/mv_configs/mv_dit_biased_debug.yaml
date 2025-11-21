@@ -1,0 +1,68 @@
+model:
+  base_learning_rate: 5.0e-05
+  adjust_learning_rate: false
+  find_unused_parameters: true
+  gradient_clip_algorithm: norm
+  precision: bf16
+  grad_clip: 1.0
+  grad_acc_steps: 4
+  target: models.second_stage.mv_fm_model.ModelIF
+  params:
+    warmup_steps: 5000
+    min_lr_multiplier: 0.1
+    enc_scale: 4
+    enc_scale_dino: 4
+    adjust_lr_to_batch_size: false
+    tokenizer_config:
+      folder: $TK_WORK_DIR/2025-04-08T15-23-09_custom_f16_16384_dim16_L5_sepEnc_dinox2_0_vq_only_wo_adv_lmbgpu20_SE2_mixed_adv_dec_only
+      ckpt_path: checkpoints/epoch-3.ckpt
+    generator_config:
+      target: networks.DiT.dit_mv.MVSTDiT
+      params:
+        max_num_frames: 8
+        hidden_size: 640
+        depth: 24
+        num_heads: 16
+        mlp_ratio: 4
+        input_size:
+        - 16
+        - 16
+        patch_size: 1
+        in_channels: 32
+        dropout: 0.0
+        drop_ctx_rate: 0.1
+        cond_signals:
+          raymaps:
+            target: networks.DiT.dit_mv.NPatchEmbed
+            params:
+              patch_embed_cfg:
+                target: timm.models.vision_transformer.PatchEmbed
+                params:
+                  img_size: 256
+                  patch_size: 16
+                  embed_dim: ${model.params.generator_config.params.hidden_size}
+                  in_chans: 6
+                  bias: true
+data:
+  target: data.datamodule.DataModuleFromConfig
+  params:
+    batch_size: 6
+    num_workers: 4
+    train:
+    - target: data.custom_multiframe_multiview.MultiHDF5DatasetMultiFrameMultiViewBiased
+      params:
+        hdf5_paths_file: /p/scratch/nxtaim-1/farid1/orbis/data/mv_h5_paths_debug.txt
+        size:
+        - 256
+        - 256
+        num_frames: 8
+        frame_rate_multiplier: 0.5
+    validation:
+    - target: data.custom_multiframe_multiview.MultiHDF5DatasetMultiFrameMultiViewBiased
+      params:
+        hdf5_paths_file: /p/scratch/nxtaim-1/farid1/orbis/data/mv_h5_paths_val.txt
+        size:
+        - 256
+        - 256
+        num_frames: 8
+        frame_rate_multiplier: 0.5

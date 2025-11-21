@@ -1,0 +1,70 @@
+model:
+  base_learning_rate: 5e-05
+  adjust_learning_rate: false
+  find_unused_parameters: true
+  gradient_clip_algorithm: norm
+  precision: 32-true
+  grad_clip: 0.5
+  target: models.second_stage.fm_model_repa_e2e_kl.ModelREPA
+  params:
+    warmup_steps: 5000
+    sr_loss_weight: 1.0
+    min_lr_multiplier: 0.1
+    grad_acc_steps: 1
+    grad_acc_steps_ae: 1
+    ae_loss_weight: 1.0
+    enc_scale: 1.0
+    adjust_lr_to_batch_size: false
+    add_projector: true
+    loss_type: cos_sim
+    add_norm: false
+    latent_dim: 1024
+    ctx_noise_exp: 1.0
+    nan_debug: false
+    sr_latents:
+      - 10
+    tokenizer_config:
+      folder: /data/nxtaimraid02/faridk/ckpts/tk/2025-08-20T21-17-35_stage1_kl_192x336_DLC101600_dec_only
+      ckpt_path: checkpoints/last.ckpt
+    generator_config:
+      target: networks.DiT.dit_sr_bn.STDiT
+      params:
+        max_num_frames: 64
+        hidden_size: 768 #768
+        depth: 24 #24 
+        num_heads: 16
+        mlp_ratio: 4
+        patch_size: 1
+        input_size:
+        - 12
+        - 21
+        in_channels: 16
+        dropout: 0.0
+        drop_ctx_rate: 0.0
+        ctx_noise_aug_prob: 0.0
+        ctx_noise_aug_ratio: 0.0
+data:
+  target: data.datamodule.DataModuleFromConfig
+  params:
+    batch_size: 4
+    num_workers: 4
+    train:
+      target: data.wrapped_datasets.CachedMultiHDF5DatasetMultiFrame
+      params:
+        hdf5_paths_file: /data/nxtaimraid02/faridk/data/train_640x360_avail.txt
+        size: [192, 336]
+        num_frames: 8
+        caching_path: /data/nxtaimraid02/faridk/data/cached_latents/dinov3l
+        cache_mode: read
+        split: train
+        model_cfg_path: data/latent_cache/dinov3l.json
+    validation:
+      target: data.wrapped_datasets.CachedMultiHDF5DatasetMultiFrame
+      params:
+        hdf5_paths_file: /data/nxtaimraid02/faridk/data/val_640x360.txt
+        size: [192, 336]
+        num_frames: 8
+        caching_path: /data/nxtaimraid02/faridk/data/cached_latents/dinov3l
+        cache_mode: read
+        split: val
+        model_cfg_path: data/latent_cache/dinov3l.json

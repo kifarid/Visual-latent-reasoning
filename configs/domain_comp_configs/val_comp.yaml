@@ -1,0 +1,35 @@
+data:
+  target: data.datamodule.DataModuleFromConfig
+  params:
+    batch_size: 8
+    num_workers: 4
+    train:
+    - target: data.custom_multiframe.MultiHDF5DatasetMultiFrameRandomizeFrameRate
+      params:
+        hdf5_paths_file: /work/dlcsmall2/galessos-bdd_ssd2/h5/train_bdd_day_clear_12k_5Hz_videos_640x360.txt
+        size:
+        - 288
+        - 512
+        num_frames: 6
+        stored_data_frame_rate: 5
+        frame_rates_and_weights:
+        - - 5
+          - 1
+        aug: random_shift
+        scale_min: 0.15
+        scale_max: 0.5
+    validation:
+      target: data.custom_multiframe.MultiHDF5DatasetMultiFrame
+      params:
+        hdf5_paths_file: /p/scratch/nxtaim-1/farid1/orbis/configs/val_comp.txt
+        size:
+        - 288
+        - 512
+        num_frames: 6
+        stored_data_frame_rate: 5
+        frame_rates_and_weights:
+        - - 5
+          - 1
+        aug: random_shift
+        scale_min: 0.15
+        scale_max: 0.5

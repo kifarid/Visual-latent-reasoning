@@ -1,0 +1,110 @@
+model:
+  base_learning_rate: 5.0e-05
+  adjust_learning_rate: false
+  find_unused_parameters: true
+  gradient_clip_algorithm: norm
+  precision: bf16
+  grad_clip: 1.0
+  grad_acc_steps: 2
+  target: models.second_stage.cond_fm_recursive.ModelSRIF
+  params:
+    warmup_steps: 5000
+    min_lr_multiplier: 0.1
+    enc_scale: 4
+    adjust_lr_to_batch_size: false
+    add_projector: true
+    add_norm: false
+    ema_thoughts: false
+    repr_loss_weight: 0.0
+    tnk_loss_weight: 1.0
+    num_ctx_frames: 4
+    num_pred_frames: 1
+    num_thinking_frames: 4
+    num_thinking_steps: 1
+    ctx_noise_exp: 1.0
+    future_noise_exp: 0.5
+    base_feature_channels: 8
+    predictor_only_sr: true
+    condition_keys:
+      - relative_goal_xy
+    tokenizer_config:
+      folder: /p/scratch/nxtaim-1/mittal3/logs/orbis/logs_tok/2025-11-06T23-25-33_stage1_vq_if_wo_MAE_192x336_dinov2_8_24_dinov3_enc_sep_DLC12816683_mixed_ft_dec_only_combined_input
+      ckpt_path: checkpoints/last.ckpt
+    generator_config:
+      target: networks.DiT.cond_recursive_dit.RecursiveDiT
+      params:
+        max_num_frames: 100
+        hidden_size: 792
+        depth: 12
+        num_heads: 12
+        mlp_ratio: 4
+        patch_size: 1
+        input_size:
+          - 12
+          - 20
+        in_channels: 32
+        dropout: 0.0
+        drop_ctx_rate: 0.0
+        ctx_noise_aug_prob: 0.0
+        ctx_noise_aug_ratio: 0.0
+        main_block_type: t
+        num_spatial_per_main: 1
+        num_temporal_per_main: 0
+        num_reg_tokens: 32
+        causal_time_attn: false
+        concept_dim:
+        - 2
+        num_concepts: 1
+        concept_discrete:
+        - false
+        class_dropout_prob: 0.0
+
+      teacher_config:
+        target: models.second_stage.teacher_model.DistillationTeacher
+        params:
+          model_id: facebook/dinov3-vitl16-pretrain-lvd1689m
+          revision: main
+          device: cuda
+          dtype: bf16
+          reg_tokens: 4
+          class_tokens: 1
+          patch_size: 16
+
+data:
+  target: data.datamodule.DataModuleFromConfig
+  params:
+    batch_size: 2
+    num_workers: 6
+    shuffle_val: true
+    train:
+      target: data.Goal_BDD.BDDGoalDataset
+      params:
+        mp4_paths:
+        - /p/scratch/nxtaim-1/farid1/datasets/bdd100k_mp4/bdd_12k_360x640_10Hz_8keyframe_int_training.txt
+        info_root: /p/data1/nxtaim/public/bdd100k/info
+        metadata_cache_dir:  /p/scratch/nxtaim-1/farid1/datasets/bdd100k_mp4/train
+        num_frames: 100
+        ctx_frame: 3
+        direction_window: 5
+        stored_data_frame_rate: 10
+        frame_rate: 5
+        size:
+        - 192
+        - 320
+        aug: random_shift
+    validation:
+      target: data.Goal_BDD.BDDGoalDataset
+      params:
+        mp4_paths:
+        - /p/scratch/nxtaim-1/users/galesso1/datasets/bdd_mp4/scratch.txt
+        info_root: /p/data1/nxtaim/public/bdd100k/info
+        metadata_cache_dir: /p/scratch/nxtaim-1/farid1/datasets/bdd100k_mp4/val
+        num_frames: 100
+        ctx_frame: 3
+        direction_window: 5
+        stored_data_frame_rate: 10
+        frame_rate: 5
+        size:
+        - 192
+        - 320
+        aug: resize_center
