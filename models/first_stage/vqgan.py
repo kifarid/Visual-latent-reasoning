@@ -670,6 +670,56 @@ class VQModelIFSepEnc(VQModelIF):
         return self.decoder(quant), distill_conv_out
 
 
+class PatchifyingFirstStage(torch.nn.Module):
+    def __init__(self, *args, patch_size=16, enable_patchify=True, **kwargs):
+        """
+        Identity first-stage that optionally reshapes inputs into patch tokens for transformer-style models.
+        """
+        super().__init__()
+        self.patch_size = patch_size
+        self.enable_patchify = enable_patchify
+
+    def unpatchify(self, x):
+        if not self.enable_patchify:
+            return x
+        bsz = x.shape[0]
+        p = self.patch_size
+        c = x.shape[1] // (p * p)
+        num_tokens_h = x.shape[2]
+        num_tokens_w = x.shape[3]
+
+        x = x.reshape(bsz, c, p, p, num_tokens_h, num_tokens_w)
+        x = torch.einsum('ncpqhw->nchpwq', x)
+        x = x.reshape(bsz, c, num_tokens_h * p, num_tokens_w * p)
+        return x
+
+    def patchify(self, x):
+        if not self.enable_patchify:
+            return x
+        bsz, c, h, w = x.shape
+        p = self.patch_size
+        if h % p != 0 or w % p != 0:
+            raise ValueError(f"Input shape {(h, w)} must be divisible by patch_size={p} when patchifying")
+        num_tokens_h = h // p
+        num_tokens_w = w // p
+
+        x = x.reshape(bsz, c, num_tokens_h, p, num_tokens_w, p)
+        x = x.permute(0, 1, 3, 5, 2, 4)
+        x = x.reshape(bsz, c * p * p, num_tokens_h, num_tokens_w)
+        return x
+    
+    def encode(self, x, *args, **kwargs):
+        return self.patchify(x)
+
+    def decode(self, x, *args, **kwargs):
+        return self.unpatchify(x)
+
+    def quantize(self, x, *args, **kwargs):
+        return x
+
+    def forward(self, x, *args, **kwargs):
+        return self.patchify(x)
+
 class VQModelIFExtraSepEnc(VQModelIF):
     def __init__(self, 
                  encoder_config,

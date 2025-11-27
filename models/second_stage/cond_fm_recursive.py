@@ -414,12 +414,12 @@ class ModelSR(pl.LightningModule):
         loss = ((pred.float() - v.float()) ** 2)
         return loss
 
-    def sr_loss(self, pred_latents, post_latents, detach_pred= True, detach_post= True): #, detach_pre_pred= False):
+    def sr_loss(self, pred_latents, post_latents, detach_pred= True, detach_post= True, detach_pre_pred= False):
         sr_loss = 0
         sr_loss_layer = {}
         for i in range(len(pred_latents)):
             pred_latent, post_latent = pred_latents[i], post_latents[i]
-            pred_latent = pred_latent.detach() if self.predictor_only_sr else pred_latent
+            pred_latent = pred_latent.detach() if detach_pre_pred else pred_latent
             if self.predictor_proj is not None and self.predictor_norm is not None:
                 pred_latent = self.predictor_norm[i](self.predictor_proj[i]((pred_latent)))
                 post_latent = self.predictor_norm[i](post_latent)
@@ -472,7 +472,7 @@ class ModelSR(pl.LightningModule):
         future_idx = torch.full((b,), f - 1, device=device, dtype=torch.long)
         if frames_after_ctx > 2:
             mid_samples = torch.randint(ctx_len + 1, f - 1, (b,), device=device)
-            use_mid = torch.rand(b, device=device) < 0.1
+            use_mid = torch.rand(b, device=device) < 0.5
             future_idx = torch.where(use_mid, mid_samples, future_idx)
         future_frame = images[torch.arange(b, device=device), future_idx].unsqueeze(1)
 
@@ -488,7 +488,7 @@ class ModelSR(pl.LightningModule):
             thinking_frames = list(torch.unbind(gathered, dim=1))
             thinking_ids = list(torch.unbind(idx, dim=1))
 
-        context_ids = torch.arange(context.shape[1], device=device, dtype=torch.long).unsqueeze(0).repeat(b, 1)
+        context_ids = torch.arange(context.shape[1], device=device, dtype=torch.long).unsqueeze(0).expand(b, -1)
         next_ids = torch.full((b, 1), next_idx, device=device, dtype=torch.long)
         future_ids = future_idx.unsqueeze(-1)
         frame_ids = {
@@ -527,12 +527,9 @@ class ModelSR(pl.LightningModule):
 
         v_loss = self.v_loss(target, pred, noise, t)
         v_nf_loss_mean = v_loss.mean()
-        loss_recon_map, loss_sem_map = self._split_recon_semantic(v_loss, dim=2)
-        loss_recon_nf = loss_recon_map.mean()
-        loss_sem_nf = loss_sem_map.mean()
+        loss_recon_nf, loss_sem_nf = map(lambda x: x.mean(), torch.chunk(v_loss, 2, dim=2))
 
         # Future frame prediction step 
-        
         target = future_frame
         t = torch.rand((x.shape[0],), device=x.device).pow(self.future_noise_exp)
         target_t, noise = self.add_noise(target, t)
@@ -545,7 +542,6 @@ class ModelSR(pl.LightningModule):
         v_ff_loss_mean = v_ff_loss.mean()
        
         # Thinking to future prediction
-        
         context_noised, _ = self.add_noise_ctx(thinking_frames[0], noise=None)
         frame_ids_tff = torch.cat([frame_ids["thinking"][0], frame_ids["future"]], dim=1)
         pred, curr_tnk_reg = self.vit(target_t, context_noised, t, frame_idxs=frame_ids_tff, return_regs=self.reg_latents, y=labels)
@@ -558,8 +554,7 @@ class ModelSR(pl.LightningModule):
         curr_tnk_reg = pred_regs_ff[-1].detach()
         for i in range(self.num_thinking_steps):
             context = thinking_frames[i]
-            #context_noised, ctx_noise = self.add_noise_ctx(context, noise=None) if context is not None else (None, None)
-            context_noised = context
+            context_noised, ctx_noise = self.add_noise_ctx(context, noise=None) if context is not None else (None, None)
             block_start, block_end = self.block_intervals[i]
             frame_ids_tnk = torch.cat([frame_ids["thinking"][i], frame_ids["future"]], dim=1)
             pred, curr_tnk_reg = self.thoughts_vit(target_t, context_noised, t, frame_idxs=frame_ids_tnk, reg_tokens = curr_tnk_reg, return_regs=self.reg_latents, block_start = block_start, block_end = block_end, y=labels)
@@ -578,7 +573,7 @@ class ModelSR(pl.LightningModule):
         repr_loss_val, repr_loss_layers = self.sr_loss(pred_regs_ff, tnk_regs, detach_post=False, detach_pred=True)
         repr_loss_val_mean = repr_loss_val.mean() if hasattr(repr_loss_val, "mean") else repr_loss_val
         # thinking loss 
-        tnk_loss_val, tnk_loss_layers = self.sr_loss(pred_regs_ff, tnk_regs, detach_post=True, detach_pred=False) 
+        tnk_loss_val, tnk_loss_layers = self.sr_loss(pred_regs_ff, tnk_regs, detach_post=True, detach_pred=False, detach_pre_pred=self.predictor_only_sr) 
         tnk_loss_val_mean = tnk_loss_val.mean() if hasattr(tnk_loss_val, "mean") else tnk_loss_val
         # Total loss
         loss = self.recon_loss_weight * v_losses_mean + self.repr_loss_weight * repr_loss_val_mean + self.tnk_loss_weight * tnk_loss_val_mean
@@ -630,9 +625,7 @@ class ModelSR(pl.LightningModule):
 
         v_loss = self.v_loss(target, pred, noise, t)
         v_nf_loss_mean = v_loss.mean()
-        loss_recon_map, loss_sem_map = self._split_recon_semantic(v_loss, dim=2)
-        loss_recon_nf = loss_recon_map.mean()
-        loss_sem_nf = loss_sem_map.mean()
+        loss_recon_nf, loss_sem_nf = map(lambda x: x.mean(), torch.chunk(v_loss, 2, dim=2))
 
         # Future frame prediction step 
         target = future_frame
@@ -660,8 +653,7 @@ class ModelSR(pl.LightningModule):
 
         for i in range(self.num_thinking_steps):
             context = thinking_frames[i]
-            #context_noised, ctx_noise = self.add_noise_ctx(context, noise=None) if context is not None else (None, None)
-            context_noised = context
+            context_noised, ctx_noise = self.add_noise_ctx(context, noise=None) if context is not None else (None, None)
             block_start, block_end = self.block_intervals[i]
             frame_ids_tnk = torch.cat([frame_ids["thinking"][i], frame_ids["future"]], dim=1)
             pred, curr_tnk_reg = self.thoughts_vit(target_t, context_noised, t, frame_idxs=frame_ids_tnk, reg_tokens = curr_tnk_reg, return_regs=self.reg_latents, block_start = block_start, block_end = block_end, y=labels)
@@ -770,6 +762,9 @@ class ModelSR(pl.LightningModule):
         labels = self.get_labels(batch)
         N = min(4, images.size(0))
         images = images[:N]
+        if labels is not None:
+            labels = [(k, v[:N]) for k, v in labels]
+
         total_frames = images.size(1)
         if total_frames == 0:
             raise ValueError("Expected at least one frame per sample for logging.")
@@ -778,18 +773,18 @@ class ModelSR(pl.LightningModule):
         next_idx = self.num_context_frames
         next_frame = images[:N//2, next_idx:next_idx + 1]     # [N/2, 1, C, H, W]
         future_frame = images[:N//2, -1:]                     # [N/2, 1, C, H, W]
-        if labels is not None:
-            labels = [(k, torch.cat([v[:N//2], v[:N//2]], dim=0)) for k, v in labels]
 
         # concatenate targets
-        context = torch.cat([context, context], dim=0)          # [N, ctx, C, H, W]
+        context = torch.cat([context,context], dim=0)          # [N, ctx, C, H, W]
         targets = torch.cat([next_frame, future_frame], dim=0) # [N, 1, C, H, W]
         images = torch.cat([context, targets], dim=1)          # [N, ctx+1, C, H, W]
 
         # frame ids
         b, S = images.size(0), images.size(1)
-        frame_ids = torch.arange(S, device=images.device).unsqueeze(0).repeat(b, 1)
+        frame_ids = torch.arange(S, device=images.device).unsqueeze(0).expand(b, -1)
+        frame_ids[:N//2, -1] = next_idx
         frame_ids[N//2:, -1] = total_frames - 1
+
         b, f, e, h, w = images.size()
 
         l_visual_recon = [images[:,f] for f in range(images.size(1))]
@@ -857,8 +852,6 @@ class ModelSRIF(ModelSR):
                 ema_thoughts = True,
                 predictor_only_sr = False,
                 condition_keys=None,
-                max_patch_size_second_stage=(6, 16),
-                base_feature_channels=None,
     ):
 
         super().__init__(
@@ -889,26 +882,9 @@ class ModelSRIF(ModelSR):
             tnk_loss_weight=tnk_loss_weight,
             ema_thoughts=ema_thoughts,
             predictor_only_sr=predictor_only_sr,
-            condition_keys=condition_keys,
-            max_patch_size_second_stage=max_patch_size_second_stage,
+            condition_keys=condition_keys
         )
         self.enc_scale_dino = enc_scale_dino
-        self.base_feature_channels = base_feature_channels
-
-    def _resolve_base_feature_channels(self, total_channels: int) -> int:
-        base_ch = self.base_feature_channels
-        if base_ch is None:
-            base_ch = (total_channels + 1) // 2
-        if base_ch <= 0 or base_ch >= total_channels:
-            raise ValueError(
-                f"base_feature_channels must be in [1, {total_channels - 1}], got {base_ch}"
-            )
-        return base_ch
-
-    def _split_recon_semantic(self, tensor: torch.Tensor, dim: int):
-        total = tensor.size(dim)
-        base = self._resolve_base_feature_channels(total)
-        return torch.split(tensor, [base, total - base], dim=dim)
         
     
     def training_step(self, batch, batch_idx):
@@ -933,9 +909,7 @@ class ModelSRIF(ModelSR):
         pred, pred_regs_nf = self.vit(target_t, context_noised, t, frame_idxs=frame_ids_nf, return_regs=self.reg_latents, y=labels)
         v_loss = self.v_loss(target, pred, noise, t)
         v_nf_loss_mean = v_loss.mean()
-        loss_recon_map, loss_sem_map = self._split_recon_semantic(v_loss, dim=2)
-        loss_recon_nf = loss_recon_map.mean()
-        loss_sem_nf = loss_sem_map.mean()
+        loss_recon_nf, loss_sem_nf = map(lambda x: x.mean(), torch.chunk(v_loss, 2, dim=2))
 
         # Future frame prediction
         target = future_frame
@@ -946,9 +920,7 @@ class ModelSRIF(ModelSR):
         pred, pred_regs_ff = self.vit(target_t, context_noised, t, frame_idxs=frame_ids_ff, return_regs=self.reg_latents, y=labels)
         v_ff_loss = self.v_loss(target, pred, noise, t)
         v_ff_loss_mean = v_ff_loss.mean()
-        loss_recon_map, loss_sem_map = self._split_recon_semantic(v_ff_loss, dim=2)
-        loss_recon_ff = loss_recon_map.mean()
-        loss_sem_ff = loss_sem_map.mean()
+        loss_recon_ff, loss_sem_ff = map(lambda x: x.mean(), torch.chunk(v_ff_loss, 2, dim=2))
 
         # Thinking to future prediction
         context_noised, _ = self.add_noise_ctx(thinking_frames[0], noise=None)
@@ -956,17 +928,14 @@ class ModelSRIF(ModelSR):
         pred, curr_tnk_reg = self.vit(target_t, context_noised, t, frame_idxs=frame_ids_tff, return_regs=self.reg_latents, y=labels)
         v_tff_loss = self.v_loss(target, pred, noise, t)
         v_tff_loss_mean = v_tff_loss.mean()
-        loss_recon_map, loss_sem_map = self._split_recon_semantic(v_tff_loss, dim=2)
-        loss_recon_tff = loss_recon_map.mean()
-        loss_sem_tff = loss_sem_map.mean()
+        loss_recon_tff, loss_sem_tff = map(lambda x: x.mean(), torch.chunk(v_tff_loss, 2, dim=2))
 
         # Recursive prediction over thinking frames
         tnk_regs, v_tnk_losses = [], []
         curr_tnk_reg = pred_regs_ff[-1].detach()
         for i in range(self.num_thinking_steps):
             context = thinking_frames[i]
-            #context_noised, ctx_noise = self.add_noise_ctx(context, noise=None) if context is not None else (None, None)
-            context_noised = context
+            context_noised, _ = self.add_noise_ctx(context, noise=None) if context is not None else (None, None)
             block_start, block_end = self.block_intervals[i]
             frame_ids_tnk = torch.cat([frame_ids["thinking"][i], frame_ids["future"]], dim=1)
             pred, curr_tnk_reg = self.thoughts_vit(target_t, context_noised, t, frame_idxs=frame_ids_tnk, reg_tokens=curr_tnk_reg, return_regs=self.reg_latents, block_start=block_start, block_end=block_end, y=labels)
@@ -982,7 +951,7 @@ class ModelSRIF(ModelSR):
         assert len(pred_regs_ff) == len(tnk_regs), "intermediate generated thinking tokens shpould match in length to the feature repr tokens"
         repr_loss_val, repr_loss_layers = self.sr_loss(pred_regs_ff, tnk_regs, detach_post=False, detach_pred=True)
         repr_loss_val_mean = repr_loss_val.mean() if hasattr(repr_loss_val, "mean") else repr_loss_val
-        tnk_loss_val, tnk_loss_layers = self.sr_loss(pred_regs_ff, tnk_regs, detach_post=True, detach_pred=False)
+        tnk_loss_val, tnk_loss_layers = self.sr_loss(pred_regs_ff, tnk_regs, detach_post=True, detach_pred=False, detach_pre_pred=self.predictor_only_sr) 
         tnk_loss_val_mean = tnk_loss_val.mean() if hasattr(tnk_loss_val, "mean") else tnk_loss_val
 
         loss = self.recon_loss_weight * v_losses_mean + self.repr_loss_weight * repr_loss_val_mean + self.tnk_loss_weight * tnk_loss_val_mean
@@ -1022,9 +991,7 @@ class ModelSRIF(ModelSR):
         pred, pred_regs_nf = self.vit(target_t, context_noised, t, frame_idxs=frame_ids_nf, return_regs=self.reg_latents, y=labels)
         v_loss = self.v_loss(target, pred, noise, t)
         v_nf_loss_mean = v_loss.mean()
-        loss_recon_map, loss_sem_map = self._split_recon_semantic(v_loss, dim=2)
-        loss_recon_nf = loss_recon_map.mean()
-        loss_sem_nf = loss_sem_map.mean()
+        loss_recon_nf, loss_sem_nf = map(lambda x: x.mean(), torch.chunk(v_loss, 2, dim=2))
 
         target = future_frame
         t = torch.rand((x.shape[0],), device=x.device).pow(self.future_noise_exp)
@@ -1034,9 +1001,7 @@ class ModelSRIF(ModelSR):
         pred, pred_regs_ff = self.vit(target_t, context_noised, t, frame_idxs=frame_ids_ff, return_regs=self.reg_latents, y=labels)
         v_ff_loss = self.v_loss(target, pred, noise, t)
         v_ff_loss_mean = v_ff_loss.mean()
-        loss_recon_map, loss_sem_map = self._split_recon_semantic(v_ff_loss, dim=2)
-        loss_recon_ff = loss_recon_map.mean()
-        loss_sem_ff = loss_sem_map.mean()
+        loss_recon_ff, loss_sem_ff = map(lambda x: x.mean(), torch.chunk(v_ff_loss, 2, dim=2))
 
         # Thinking to future prediction
         context_noised, _ = self.add_noise_ctx(thinking_frames[0], noise=None)
@@ -1044,16 +1009,13 @@ class ModelSRIF(ModelSR):
         pred, curr_tnk_reg = self.vit(target_t, context_noised, t, frame_idxs=frame_ids_tff, return_regs=self.reg_latents, y=labels)
         v_tff_loss = self.v_loss(target, pred, noise, t)
         v_tff_loss_mean = v_tff_loss.mean()
-        loss_recon_map, loss_sem_map = self._split_recon_semantic(v_tff_loss, dim=2)
-        loss_recon_tff = loss_recon_map.mean()
-        loss_sem_tff = loss_sem_map.mean()
+        loss_recon_tff, loss_sem_tff = map(lambda x: x.mean(), torch.chunk(v_tff_loss, 2, dim=2))
 
         tnk_regs, v_tnk_losses = [], []
         curr_tnk_reg = pred_regs_ff[-1]
         for i in range(self.num_thinking_steps):
             context = thinking_frames[i]
-            #context_noised, ctx_noise = self.add_noise_ctx(context, noise=None) if context is not None else (None, None)
-            context_noised = context
+            context_noised, _ = self.add_noise_ctx(context, noise=None) if context is not None else (None, None)
             block_start, block_end = self.block_intervals[i]
             frame_ids_tnk = torch.cat([frame_ids["thinking"][i], frame_ids["future"]], dim=1)
             pred, curr_tnk_reg = self.thoughts_vit(target_t, context_noised, t, frame_idxs=frame_ids_tnk, reg_tokens=curr_tnk_reg, return_regs=self.reg_latents, block_start=block_start, block_end=block_end, y=labels)
@@ -1095,6 +1057,7 @@ class ModelSRIF(ModelSR):
         else:
             b, e, h, w = images.size()
             f = 1
+
         x = self.ae.encode(images)['continuous']
         x0, x1 = x[0] * self.enc_scale, x[1] * self.enc_scale_dino
         x = torch.cat([x0, x1], dim=1)
