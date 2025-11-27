@@ -198,12 +198,14 @@ cython_debug/
 
 logs*
 vjepa*
-<<<<<<< HEAD
 outputs*
 *.pkl
 *.pth
 *.gif
 *.png
-=======
-*.pth
->>>>>>> 0a1da43 (some changes to configs)
+*.gz
+*.csv
+*.zip
+
+# Local MNIST Sudoku dataset artifacts
+datasets/mnist_sudoku/
