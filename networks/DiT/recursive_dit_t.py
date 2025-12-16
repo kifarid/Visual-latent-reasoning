@@ -21,20 +21,41 @@ from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
 from timm.layers.attention import AttentionRope
 from omegaconf import ListConfig
 
+def broadcast_match(x: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """
+    Insert singleton dims in x so that it is broadcastable to target.
+    Assumes:
+      - dim 0 is batch, dim -1 is channels
+      - x and target are broadcast-compatible.
+    """
+    t_inner = list(target.shape[1:-1])      # target inner dims
+    x_inner = list(x.shape[1:-1])           # x inner dims
 
-def _broadcast(bvec: torch.Tensor):
-    # bvec: [B, D] -> [B, 1, 1, D]
-    return bvec.unsqueeze(1).unsqueeze(1)
+    i = 0
+    positions = []
+    # greedily match x_inner dims into t_inner
+    for j, td in enumerate(t_inner):
+        if i < len(x_inner) and (x_inner[i] == td or x_inner[i] == 1):
+            positions.append(j)
+            i += 1
+    # assume all x_inner are matched (you guaranteed this by construction)
+
+    used = set(positions)
+    offset = 0
+    # insert 1-dims at the remaining positions
+    for j in range(len(t_inner)):
+        if j not in used:
+            dim = 1 + j + offset          # +1 to skip batch dim
+            x = x.unsqueeze(dim)
+            offset += 1
+
+    return x
 
 
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor):
-    if x.dim() == 3:
-        # x: [B, N, C], shift: [B, C], scale: [B, C]
-        return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
-    if x.dim() == 4:
-        # x: [B, T, N, C], shift: [B, C], scale: [B, C]
-        return x * (1 + _broadcast(scale)) + _broadcast(shift)
-    raise ValueError(f"Unsupported input shape: {x.shape}. Expected 3D or 4D tensor.")
+    """Applies adaLN-Zero modulation to input tensor x."""
+    # x: [B, T, N, C], shift: [B, C], scale: [B, C]
+    return x * (1 + scale) + shift
 
 
 def trunc_normal_init_(tensor: torch.Tensor, std: float = 1.0, lower: float = -2.0, upper: float = 2.0):
@@ -493,12 +514,12 @@ class FlexDiTBlock(nn.Module):
             y = rearrange(y, '(b f) n d -> b f n d', b=B, f=F)
 
         # gated residual (attention)
-        x = x + _broadcast(gate_attn) * y
+        x = x + gate_attn * y
 
         # --- MLP path ---
         x_mlp_in = modulate(self.norm2(x), shift_mlp, scale_mlp)
         z = self.mlp(x_mlp_in)
-        x = x + _broadcast(gate_mlp) * z
+        x = x + gate_mlp * z
         return x, reg_tokens
 
 
@@ -623,8 +644,12 @@ class DiT(nn.Module):
         t: (N, ...) tensor of diffusion timesteps
         returns: (N, ..., D) tensor of condition embeddings
         """
-        return self.t_embedder(t)
-    
+        t_shape = t.shape
+        t = t.reshape(-1)
+        t_emb = self.t_embedder(t)
+        t_emb = t_emb.reshape(*t_shape, -1)
+        return t_emb
+
     def preprocess_inputs(self, target, context, t):
         b, f_target = target.size()[:2]
         f_context = context.size(1) if context is not None else 0
@@ -807,10 +832,14 @@ class FlexDiT(DiT):
 
     def forward(self, target, context, t, frame_idxs = None, reg_tokens=None, return_latents=[], return_regs=[], early_exit=False):
         f_pred = target.size(1)
-
-        c = self.get_condition_embeddings(t) # (B, ...) -> (B, ..., D) THE ... could be either 0 or HW, or F, HW
+        #  (B, F, H, W) -> (B, F, HW)
+        if t.ndim == 1:
+            t = t[:, None, None, None]
+            t = t.expand(-1, f_pred, *self.x_embedder.grid_size)
+        t = rearrange(t, 'B F H W -> B F (H W)')
+        
+        c = self.get_condition_embeddings(t) # (B, F, HW) -> (B, F, HW, D) 
         x = self.preprocess_inputs(target, context, t)  # (B, F, HW, D)
-
         batch_size, seq_len, num_tokens, _ = x.shape
         if num_tokens != self.rope.hw:
             raise ValueError(f"Token count {num_tokens} does not match RoPE HW={self.rope.hw}.")

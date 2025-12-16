@@ -1,0 +1,105 @@
+model:
+  base_learning_rate: 5.0e-05
+  adjust_learning_rate: false
+  find_unused_parameters: true
+  gradient_clip_algorithm: norm
+  grad_clip: 1.0
+  precision: bf16
+  grad_acc_steps: 1
+  target: models.second_stage.fm_recursive_images_sudist.ModelSR
+  params:
+    # training
+    warmup_steps: 2000
+    min_lr_multiplier: 0.1
+    adjust_lr_to_batch_size: false
+    scheduler_config:
+      target: modules.mask_scheduler.UnconditionalMaskGITScheduler
+      params:
+        default_schedule_mode: arccos
+        default_schedule_mode_train: arccos
+        default_num_steps: 12
+        disable_bar: true
+        num_tokens: 81
+        max_block_size: 3
+        mask_value: -1
+        codebook_size: -1
+    time_sampler_cfg:
+      target: modules.mean_beta.MeanBeta
+      params:
+        scalar_time_sampler: uniform
+        name: mean_beta
+        beta_sharpness: 1.0
+    # architecture
+    enc_scale: 1
+    add_projector: false
+    add_norm: false
+    ema_thoughts: false
+    repr_loss_weight: 0.0
+    tnk_loss_weight: 1.0
+    loss_type: cos_sim
+    ctx_noise_exp: 1.0
+    future_noise_exp: 0.5
+    # frame layout (single-frame generation)
+    num_ctx_frames: 0
+    num_pred_frames: 1
+    num_thinking_frames: 1
+    num_thinking_steps: 6
+    # second-stage patching: 28x28 → 9x9 tokens on 252x252 grids
+    max_patch_size_second_stage:
+      - 28
+      - 28
+    tokenizer_config:
+      # Pseudo-tokenizer trained with 28x28 patchifying first stage (VQGAN)
+      folder: $TK_WORK_DIR/pseudo_tok_mnist_patch28
+      ckpt_path: #checkpoints/last.ckpt
+    generator_config:
+      target: networks.DiT.recursive_dit_t.RecursiveDiT
+      params:
+        max_num_frames: 81
+        hidden_size: 864
+        depth: 24
+        num_heads: 12
+        mlp_ratio: 4
+        patch_size: 28
+        input_size:
+          - 252
+          - 252
+        in_channels: 1
+        dropout: 0.0
+        drop_ctx_rate: 0.0
+        ctx_noise_aug_prob: 0.0
+        ctx_noise_aug_ratio: 0.0
+        main_block_type: s
+        num_spatial_per_main: 0
+        num_temporal_per_main: 0
+        num_reg_tokens: 16
+        causal_time_attn: false
+
+data:
+  target: data.datamodule.DataModuleFromConfig
+  params:
+    batch_size: 16
+    num_workers: 8
+    shuffle_val: true
+    train:
+      target: data.mnist_sudoku.MnistSudokuGridDataset
+      params:
+        root: ./data/mnist_sudoku
+        split: train
+        image_size:
+          - 252
+          - 252
+        to_rgb: true
+        allow_synthetic_if_missing: true
+        test_samples_num: 0 
+    validation:
+      target: data.mnist_sudoku.MnistSudokuGridDataset
+      params:
+        root: ./data/mnist_sudoku
+        split: val
+        image_size:
+          - 252
+          - 252
+        to_rgb: true
+        allow_synthetic_if_missing: true
+        test_samples_num: 0 

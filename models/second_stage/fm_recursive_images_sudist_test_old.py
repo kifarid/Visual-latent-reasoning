@@ -75,7 +75,9 @@ class ModelSR(pl.LightningModule):
                 repr_loss_weight = 1.0,
                 tnk_loss_weight = 1.0,
                 ema_thoughts = True, 
-                predictor_only_sr = False
+                predictor_only_sr = False,
+                scheduler_config = None,
+                time_sampler_cfg = None,
                 #learning_rate = 1e-4,
                 #num_iters_per_epoch = 1,
                 
@@ -89,7 +91,7 @@ class ModelSR(pl.LightningModule):
         self.num_thinking_steps = num_thinking_steps
         self.enc_scale = enc_scale
         self.has_context = self.num_context_frames > 0
-        self.has_thinking = self.has_context and self.num_thinking_steps > 0 and self.num_thinking_frames > 0
+        self.has_thinking =  self.num_thinking_steps > 0 and self.num_thinking_frames > 0
 
         # Training parameters
         self.adjust_lr_to_batch_size = adjust_lr_to_batch_size
@@ -122,6 +124,25 @@ class ModelSR(pl.LightningModule):
         self.ctx_noise_exp =ctx_noise_exp
         self.future_noise_exp = future_noise_exp
         self.max_patch_size_second_stage = max_patch_size_second_stage
+        self.time_sampler_cfg = time_sampler_cfg
+        self.time_sampler = None
+        self.time_sampler_resolution = None
+
+        if self.time_sampler_cfg is not None:
+            cfg = OmegaConf.to_container(self.time_sampler_cfg, resolve=True)
+            params = cfg.setdefault("params", {})
+
+            in_h, in_w = self.vit.input_size
+            if isinstance(self.vit.patch_size, (tuple, list)):
+                p_h, p_w = self.vit.patch_size[:2]
+            else:
+                p_h = p_w = self.vit.patch_size
+
+            assert in_h % p_h == 0 and in_w % p_w == 0, "input_size must be divisible by patch_size"
+            params["resolution"] = (in_h // p_h, in_w // p_w)
+
+            self.time_sampler = instantiate_from_config(cfg)
+            self.time_sampler_resolution = params["resolution"]
 
         # block intervals 
         if self.has_thinking:
@@ -141,6 +162,9 @@ class ModelSR(pl.LightningModule):
         self.ema_thoughts = ema_thoughts
         self.thoughts_vit = self.ema_vit if ema_thoughts else self.vit
         self.predictor_only_sr = predictor_only_sr
+
+        # Masking schedule parameters
+        self.scheduler = instantiate_from_config(scheduler_config) if scheduler_config is not None else None
 
     def alpha(self, t):
         return 1.0 - t
@@ -167,12 +191,6 @@ class ModelSR(pl.LightningModule):
         tokenizer_config = OmegaConf.load(os.path.join(tokenizer_folder, "config.yaml"))
         model = instantiate_from_config(tokenizer_config.model)
         # Load checkpoint
-        #check if path exists 
-        ckpt_path_full = os.path.join(tokenizer_folder, ckpt_path)
-        #if 
-        #checkpoint = torch.load(os.path.join(tokenizer_folder, ckpt_path), map_location="cpu", weights_only=True)["state_dict"]
-        #model.load_state_dict(checkpoint, strict=False)
-        #turn off require grads
         requires_grad(model, False)
         model.eval()
         return model
@@ -311,7 +329,7 @@ class ModelSR(pl.LightningModule):
             )
         return x
 
-    def add_noise_ctx(self, x, noise=None, patch_size=None, mask=None, batch_mask=None, t=None):
+    def add_noise_ctx(self, x, noise=None, mask=None, t=None):
         """
         Add diffusion-style noise to context latents per patch. Supports two modes:
         - tube_ctx_mask=True: one time/noise per spatial patch across all frames (tubes)
@@ -319,45 +337,21 @@ class ModelSR(pl.LightningModule):
         Returns the possibly noised context and the corresponding noise mapped back to
         the original grid.
         """
-        _, _, _, h, w = x.shape
+        b, f, _, h, w = x.shape
         vit_patch = self.vit.patch_size
         if isinstance(vit_patch, (tuple, list)):
             vit_patch_h, vit_patch_w = vit_patch[:2]
         else:
             vit_patch_h = vit_patch_w = vit_patch
+        patch_size_h = vit_patch_h
+        patch_size_w = vit_patch_w
 
-        if patch_size is not None:
-            if isinstance(patch_size, int):
-                patch_size_h = patch_size_w = patch_size
-            else:
-                patch_size_h, patch_size_w = patch_size[:2]
-        else:
-            max_patch = self.max_patch_size_second_stage
-            if isinstance(max_patch, (tuple, list)):
-                if len(max_patch) == 1:
-                    max_patch_h = max_patch_w = max_patch[0]
-                else:
-                    max_patch_h, max_patch_w = max_patch[:2]
-            elif max_patch is None:
-                max_patch_h = vit_patch_h
-                max_patch_w = vit_patch_w
-            else:
-                max_patch_h = max_patch_w = max_patch
-            max_patch_h = max(max_patch_h, vit_patch_h)
-            max_patch_w = max(max_patch_w, vit_patch_w)
-            candidates_h = [p for p in range(vit_patch_h, max_patch_h + 1) if h % p == 0] or [vit_patch_h]
-            candidates_w = [p for p in range(vit_patch_w, max_patch_w + 1) if w % p == 0] or [vit_patch_w]
-            patch_size_h = random.choice(candidates_h)
-            patch_size_w = random.choice(candidates_w)
-
-        # Patch
+        # Patch (b, f, e, h, w) -> (b*h_p*w_p, f, e, p, p) or (b*f*h_p*w_p, e, p, p)
         x_patched, meta = self.patch_second_stage(x, patch_size=(patch_size_h, patch_size_w))
 
-        # Sample one t per patched item (matches x_patched.shape[0])
+        # Sample one t/mask per patched item (matches x_patched.shape[0])
         t = torch.rand((x_patched.shape[0],), device=x.device).pow(self.ctx_noise_exp) if t is None else t
-
-        # Sample one mask per patched item
-        mask = torch.rand((x_patched.shape[0],), device=x.device) < self.ctx_noise_prob if mask is None else mask
+        mask = (torch.rand((x_patched.shape[0],), device=x.device) < self.ctx_noise_prob) if mask is None else mask
 
         # Prepare noise and apply forward noising
         noise = torch.randn_like(x_patched) if noise is None else noise
@@ -365,17 +359,14 @@ class ModelSR(pl.LightningModule):
         x_t_noised = self.alpha(t).view(*s) * x_patched + self.sigma(t).view(*s) * noise
 
         # Mix noised vs. clean per-patch with ctx_noise_prob
-        x_t_noised = torch.where(mask.view(-1, 1, 1, 1, 1), x_t_noised, x_patched)
+        x_t_noised = torch.where( mask.view(-1, 1, 1, 1, 1) , x_t_noised, x_patched)
+        noise = torch.where(mask.view(-1, 1, 1, 1, 1), noise, torch.zeros_like(noise))
 
-        # Unpatch back to grid
+        # Unpatch back to grid (b, f, e, h, w)
         x_t_noised = self.unpatch_second_stage(x_t_noised, meta)
         noise = self.unpatch_second_stage(noise, meta)
 
-        # Mix noised vs. clean per-sample with ctx_noise_prob
-        b = x.shape[0]
-        batch_mask = (torch.rand(b, device=x.device) < 0.95).view(b, 1, 1, 1, 1) if batch_mask is None else batch_mask
-        x = torch.where(batch_mask, x_t_noised, x)
-        return x, (noise, mask, batch_mask, t, (patch_size_h, patch_size_w))
+        return x, (noise, mask, t, (patch_size_h, patch_size_w))
 
     def add_noise(self, x, t, noise=None):
         noise = torch.randn_like(x) if noise is None else noise
@@ -460,11 +451,10 @@ class ModelSR(pl.LightningModule):
         of length `thinking_steps` and each entry has shape `(b, num_thinking_frames, e, h, w)`.
         the function also returns frame ids, with shape b, .. for each of the predictions 
         '''
-        #TODO return the frame ids for each of the returned arrays 
         if images.ndim == 4:
             images = images.unsqueeze(1)  # (b, 1, C, H, W)
         b, f, e, h, w = images.size()
-
+            
         device = images.device
         ctx_len = self.num_context_frames if self.has_context and f > 1 else 0
         tnk_len = self.num_thinking_frames
@@ -480,7 +470,7 @@ class ModelSR(pl.LightningModule):
         future_idx = torch.full((b,), f - 1, device=device, dtype=torch.long)
         if frames_after_ctx > 2:
             mid_samples = torch.randint(ctx_len + 1, f - 1, (b,), device=device)
-            use_mid = torch.rand(b, device=device) < 0.5
+            use_mid = torch.rand(b, device=device) < 0.9
             future_idx = torch.where(use_mid, mid_samples, future_idx)
             future_ids = future_idx.unsqueeze(-1)
             future_frame = images[torch.arange(b, device=device), future_idx].unsqueeze(1)
@@ -493,6 +483,7 @@ class ModelSR(pl.LightningModule):
             thinking_ids = None
         else:
             idx = torch.randint(ctx_len, f, (b, tnk_steps, tnk_len), device=device)
+            idx = torch.sort(idx, dim=-2).values
             flat_idx = idx.view(b, -1)
             batch_ids = torch.arange(b, device=device).unsqueeze(-1)
             gathered = images[batch_ids, flat_idx].view(b, tnk_steps, tnk_len, e, h, w)
@@ -515,24 +506,67 @@ class ModelSR(pl.LightningModule):
         return context, thinking_frames, next_frame, future_frame, frame_ids 
 
         
+    def prepare_mask_schedule(self, img_shape):
+        """
+        Prepare the masking schedule for the training step.
+        Creates a random permutation of tokens and generates a sequence of masks
+        based on the scheduler configuration.
+        masks at each level repects the patch size of the vit.
+        
+        Returns:
+            tensor: mask_sequence where:
+                - mask_sequence: stacked masks of shape (B, num_levels, F_in, 1, H//p_h, W//p_w)
+        """
+        B, F_in, _, H, W = img_shape
+        device = self.device
+
+        p_h, p_w = (self.vit.patch_size if isinstance(self.vit.patch_size, (tuple, list))
+                    else (self.vit.patch_size, self.vit.patch_size))
+        
+        max_patch = self.max_patch_size_second_stage if self.max_patch_size_second_stage is not None else (p_h, p_w)
+        max_patch_h, max_patch_w = max_patch
+        max_patch_h, max_patch_w = max(max_patch_h, p_h), max(max_patch_w, p_w)
+        candidates_h = [p for p in range(p_h, max_patch_h + 1, p_h) if H % p == 0]
+        candidates_w = [p for p in range(p_w, max_patch_w + 1, p_w) if W % p == 0]
+        patch_size_h, patch_size_w = random.choice(candidates_h), random.choice(candidates_w)
+
+        
+        grid_h, grid_w = H // patch_size_h, W // patch_size_w
+        target_h, target_w = H // p_h, W // p_w
+        total_tokens = grid_h * grid_w
+
+        # one random permutation of all tokens per sample/frame
+        order = torch.rand(B, F_in, grid_h * grid_w, device=device).argsort(dim=-1)
+        # steps to mask per level
+        sche = list(self.scheduler.adap_sche())  # e.g., [5,7,10,...]
+        cum = torch.cumsum(torch.tensor(sche, device=device), dim=0).clamp(max=total_tokens)
+        mask_sequence = [torch.ones_like(order, dtype=torch.bool)]
+        prev_mask = mask_sequence[0]
+        for needed in cum:
+            mask_tokens = order > needed  # shape matches order
+            mask_tokens = mask_tokens & prev_mask
+            prev_mask = mask_tokens
+            mask_sequence.append(mask_tokens)
+
+        # stack into extra mask-level dimension: (B, num_levels, 1, H//p_h, W//p_w)
+        mask_sequence = torch.stack(mask_sequence, dim=1)
+        mask_sequence = mask_sequence.view(B, mask_sequence.size(1), 1, grid_h, grid_w)
+        # repeat interleave to get back to original size
+        mask_sequence = mask_sequence.repeat_interleave(patch_size_h//p_h, -2).repeat_interleave(patch_size_w//p_w, -1)
+        return mask_sequence
+
     def training_step(self, batch, batch_idx):
         images, frame_rate = self.get_input(batch, 'images')
-        context, thinking_frames, next_frame, future_frame, frame_ids = self.create_context_thinking_pred(images)
-        thinking_frames = thinking_frames or []
-        segments = [context, *thinking_frames, next_frame, future_frame]
-        lengths  = [s.shape[1] if s is not None else 0 for s in segments]
-        starts = list(itertools.accumulate([0, *lengths]))[:-1]
+        #create the solution trajectory
+        if images.ndim == 4:
+            images = images.unsqueeze(1)  # -> (B,1,C,H,W)
 
-        images_filtered = torch.cat([s for s in segments if s is not None], dim=1)
+        mask_sequence = self.prepare_mask_schedule(images.shape) # (B, num_levels, F_in, 1, H//p_h, W//p_w)
+        _, thinking_frames_mask, _, future_frame_mask, frame_ids = self.create_context_thinking_pred(mask_sequence) #masks for the thinking frames
+        thinking_frames_mask = thinking_frames_mask or []
+        context = None
 
-        x = self.encode_frames(images_filtered)
-
-        pieces = [None if L == 0 else x[:, s:s+L] for s, L in zip(starts, lengths)]
-
-        context = pieces[0]
-        thinking_frames = pieces[1:1+len(thinking_frames)]
-        next_frame = pieces[1+len(thinking_frames)]
-        future_frame = pieces[2+len(thinking_frames)]
+        x = self.encode_frames(images)
         b, f, e, h, w = x.size()
 
         v_ff_loss_mean = None
@@ -542,46 +576,51 @@ class ModelSR(pl.LightningModule):
         tnk_loss_val_mean = 0.0
         repr_loss_layers = {}
 
-        # Next frame prediction step 
-        target = next_frame
-        t = torch.rand((x.shape[0],), device=x.device)
-        target_t, noise = self.add_noise(target, t)
+        # Solving in one step at a time fashion 
+        # 
+        # target_idx = torch.randint(1, mask_sequence.shape[1], (1,)).item()
+        # curr_mask = mask_sequence[:, target_idx-1]
+        # target_mask = mask_sequence[:, target_idx]
 
-        context_noised, ctx_noise = self.add_noise_ctx(context, noise=None) if context is not None else (None, None)
+        # t = self.time_sampler.get_time(b).to(x.device)
+        # t_target = torch.where(target_mask, t, 0).pow(2)
+        # t_curr = torch.where(curr_mask, t, 0)
 
-        frame_ids_nf = torch.cat([frame_ids["context"], frame_ids["next"]], dim=1) if context is not None else frame_ids["next"]
-        pred, pred_regs_nf = self.vit(target_t, context_noised, t, frame_idxs=frame_ids_nf, return_regs=self.reg_latents)
+        # target, (target_noise, _, _, _) = self.add_noise_ctx(x, t=t_target.reshape(-1), mask=target_mask.reshape(-1))
+        # target_t, (noise, _, _, _) = self.add_noise_ctx(x, t=t_curr.reshape(-1), mask=curr_mask.reshape(-1))
+        # context_noised, ctx_noise =  (None, None)
+        # frame_ids_nf = torch.ones((b, f), device=x.device, dtype=torch.long)  # next frame is always at index 0 relative to the current masked set
+        # pred, pred_regs_nf = self.vit(target_t, context_noised, t_curr - t_target, frame_idxs=frame_ids_nf, return_regs=self.reg_latents)
 
-        v_loss = self.v_loss(target, pred, noise, t)
-        v_nf_loss_mean = v_loss.mean()
-        #loss_recon_nf, loss_sem_nf = map(lambda x: x.mean(), torch.chunk(v_loss, 2, dim=2))
+        # v_loss = self.v_loss(target, pred, noise - target_noise, t)
+        # v_nf_loss_mean = v_loss.mean()
 
-        # Future frame prediction step 
+        # Future frame prediction step from zero/intermediate  to hero  
+        # pick a rand
+        future_frame = x
         if future_frame is not None:
             target = future_frame
-            t = torch.rand((x.shape[0],), device=x.device).pow(self.future_noise_exp)
-            target_t, noise = self.add_noise(target, t)
+            t = self.time_sampler.get_time(b).to(x.device)
+            r = torch.rand((x.shape[0],), device=x.device).view(t.size(0), *([1] * (t.ndim - 1)))
+            t = torch.ones_like(t) * r
 
-            context_noised, ctx_noise = self.add_noise_ctx(context, noise=None) if context is not None else (None, None)
-
-            frame_ids_ff = torch.cat([frame_ids["context"], frame_ids["future"]], dim=1) if context is not None else frame_ids["future"]
+            #pick a random start idx between 1 and mask_sequence.shape[1]-1
+            interm_idx = torch.randint(0, mask_sequence.shape[1]-1, (b,), device=mask_sequence.device)
+            batch_ids = torch.arange(b, device=mask_sequence.device)
+            interm_mask = torch.ones(mask_sequence[batch_ids, interm_idx].shape, dtype=torch.bool, device=mask_sequence.device)
+            t = torch.where(interm_mask, t, torch.zeros_like(t))
+            target_t, (noise, _, _, _) = self.add_noise_ctx(target, t=t.reshape(-1), mask=interm_mask.reshape(-1))
+            context_noised, ctx_noise = (None, None)
+            frame_ids_ff = torch.ones((b, f), device=x.device, dtype=torch.long) * (mask_sequence.shape[1] -1)  # future frame is always at index max relative to the current masked set
             pred, pred_regs_ff = self.vit(target_t, context_noised, t, frame_idxs=frame_ids_ff, return_regs=self.reg_latents)
             v_ff_loss = self.v_loss(target, pred, noise, t)
             v_ff_loss_mean = v_ff_loss.mean()
-    
-            # Thinking to future prediction
-            if thinking_frames:
-                context_noised, _ = self.add_noise_ctx(thinking_frames[0], noise=None)
-                frame_ids_tff = torch.cat([frame_ids["thinking"][0], frame_ids["future"]], dim=1)
-                pred, curr_tnk_reg = self.vit(target_t, context_noised, t, frame_idxs=frame_ids_tff, return_regs=self.reg_latents)
-                v_tff_loss = self.v_loss(target, pred, noise, t)
-                v_tff_loss_mean = v_tff_loss.mean()
 
-
-
+        # Thinkin part 
+        thinking_frames = x
         # recursive prediction step on the thinking frames
-        tnk_enabled = self.has_thinking and thinking_frames and pred_regs_ff is not None
-        v_losses = [v_nf_loss_mean]
+        tnk_enabled = self.has_thinking and True and pred_regs_ff is not None
+        v_losses = []
         if v_ff_loss_mean is not None:
             v_losses.append(v_ff_loss_mean)
         if v_tff_loss_mean is not None:
@@ -592,10 +631,10 @@ class ModelSR(pl.LightningModule):
             v_tnk_losses = []
             curr_tnk_reg = pred_regs_ff[-1].detach()
             for i in range(self.num_thinking_steps):
-                context = thinking_frames[i]
-                context_noised, ctx_noise = self.add_noise_ctx(context, noise=None) if context is not None else (None, None)
+                context_noised, ctx_noise = (None, None)
                 block_start, block_end = self.block_intervals[i]
-                frame_ids_tnk = torch.cat([frame_ids["thinking"][i], frame_ids["future"]], dim=1)
+                frame_ids_tnk = torch.ones((b, f), device=x.device, dtype=torch.long) * (mask_sequence.shape[1] - 1 -  frame_ids["thinking"][i])
+                target_t, (noise, _, _, _) = self.add_noise_ctx(target, t=t.reshape(-1), mask=thinking_frames_mask[i].reshape(-1))
                 pred, curr_tnk_reg = self.thoughts_vit(target_t, context_noised, t, frame_idxs=frame_ids_tnk, reg_tokens = curr_tnk_reg, return_regs=self.reg_latents, block_start = block_start, block_end = block_end)
                 curr_tnk_reg = curr_tnk_reg[0]
                 tnk_regs.append(curr_tnk_reg)
@@ -622,7 +661,7 @@ class ModelSR(pl.LightningModule):
 
         # Log losses as scalars
         self.log("train/loss", loss.item() if hasattr(loss, "item") else loss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
-        self.log("train/recon_loss", v_nf_loss_mean.item() if hasattr(v_nf_loss_mean, "item") else v_nf_loss_mean, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
+        #self.log("train/recon_loss", v_nf_loss_mean.item() if hasattr(v_nf_loss_mean, "item") else v_nf_loss_mean, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
         if v_ff_loss_mean is not None:
             self.log("train/future_recon_loss", v_ff_loss_mean.item() if hasattr(v_ff_loss_mean, "item") else v_ff_loss_mean, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
         if v_tff_loss_mean is not None:
@@ -642,25 +681,18 @@ class ModelSR(pl.LightningModule):
         update_ema(self.ema_vit, self.vit)
 
 
-
     def validation_step(self, batch, batch_idx):
         images, frame_rate = self.get_input(batch, 'images')
-        context, thinking_frames, next_frame, future_frame, frame_ids = self.create_context_thinking_pred(images)
-        thinking_frames = thinking_frames or []
-        segments = [context, *thinking_frames, next_frame, future_frame]
-        lengths  = [s.shape[1] if s is not None else 0 for s in segments]
-        starts = list(itertools.accumulate([0, *lengths]))[:-1]
+        #create the solution trajectory
+        if images.ndim == 4:
+            images = images.unsqueeze(1)  # -> (B,1,C,H,W)
 
-        images_filtered = torch.cat([s for s in segments if s is not None], dim=1)
+        mask_sequence = self.prepare_mask_schedule(images.shape) # (B, num_levels, F_in, 1, H//p_h, W//p_w)
+        _, thinking_frames_mask, _, future_frame_mask, frame_ids = self.create_context_thinking_pred(mask_sequence) #masks for the thinking frames
+        thinking_frames_mask = thinking_frames_mask or []
+        context = None
 
-        x = self.encode_frames(images_filtered)
-
-        pieces = [None if L == 0 else x[:, s:s+L] for s, L in zip(starts, lengths)]
-
-        context = pieces[0]
-        thinking_frames = pieces[1:1+len(thinking_frames)]
-        next_frame = pieces[1+len(thinking_frames)]
-        future_frame = pieces[2+len(thinking_frames)]
+        x = self.encode_frames(images)
         b, f, e, h, w = x.size()
 
         v_ff_loss_mean = None
@@ -670,68 +702,74 @@ class ModelSR(pl.LightningModule):
         tnk_loss_val_mean = 0.0
         repr_loss_layers = {}
 
-        # Next frame prediction step 
-        target = next_frame
-        t = torch.rand((x.shape[0],), device=x.device)
-        target_t, noise = self.add_noise(target, t)
+        # target_idx = torch.randint(1, mask_sequence.shape[1], (1,)).item()
+        # curr_mask = mask_sequence[:, target_idx-1]
+        # target_mask = mask_sequence[:, target_idx]
 
-        context_noised, ctx_noise = self.add_noise_ctx(context, noise=None) if context is not None else (None, None)
+        # t = self.time_sampler.get_time(b).to(x.device)
+        # t_target = torch.where(target_mask, t, 0).pow(2)
+        # t_curr = torch.where(curr_mask, t, 0)
 
-        frame_ids_nf = torch.cat([frame_ids["context"], frame_ids["next"]], dim=1) if context is not None else frame_ids["next"]
-        pred, pred_regs_nf = self.vit(target_t, context_noised, t, frame_idxs=frame_ids_nf, return_regs=self.reg_latents)
+        # target, (target_noise, _, _, _) = self.add_noise_ctx(x, t=t_target.reshape(-1), mask=target_mask.reshape(-1))
+        # target_t, (noise, _, _, _) = self.add_noise_ctx(x, t=t_curr.reshape(-1), mask=curr_mask.reshape(-1))
+        # context_noised, ctx_noise =  (None, None)
+        # frame_ids_nf = torch.ones((b, f), device=x.device, dtype=torch.long)  # next frame is always at index 0 relative to the current masked set
+        # pred, pred_regs_nf = self.vit(target_t, context_noised, t_curr - t_target, frame_idxs=frame_ids_nf, return_regs=self.reg_latents)
 
-        v_loss = self.v_loss(target, pred, noise, t)
-        v_nf_loss_mean = v_loss.mean()
-        
-        # Future frame prediction step 
+        # v_loss = self.v_loss(target, pred, noise - target_noise, t)
+        # v_nf_loss_mean = v_loss.mean()
+
+        # Future frame prediction step from zero/intermediate  to hero  
+        # pick a rand
+        future_frame = x
         if future_frame is not None:
             target = future_frame
-            t = torch.rand((x.shape[0],), device=x.device).pow(self.future_noise_exp)
-            target_t, noise = self.add_noise(target, t)
+            t = self.time_sampler.get_time(b).to(x.device)
+            r = torch.rand((x.shape[0],), device=x.device).view(t.size(0), *([1] * (t.ndim - 1)))
+            t = torch.ones_like(t) * r
 
-            context_noised, ctx_noise = self.add_noise_ctx(context, noise=None) if context is not None else (None, None)
-
-            frame_ids_ff = torch.cat([frame_ids["context"], frame_ids["future"]], dim=1) if context is not None else frame_ids["future"]
+            #pick a random start idx between 1 and mask_sequence.shape[1]-1
+            interm_idx = torch.randint(0, mask_sequence.shape[1]-1, (b,), device=mask_sequence.device)
+            batch_ids = torch.arange(b, device=mask_sequence.device)
+            interm_mask = torch.ones(mask_sequence[batch_ids, interm_idx].shape, dtype=torch.bool, device=mask_sequence.device)
+            print("interm_mask shape:", interm_mask.shape, "t shape:", t.shape)
+            t = torch.where(interm_mask, t, torch.zeros_like(t))
+            target_t, (noise, _, _, _) = self.add_noise_ctx(target, t=t.reshape(-1), mask=interm_mask.reshape(-1))
+            context_noised, ctx_noise = (None, None)
+            #TODO this is wrong should match the difference
+            frame_ids_ff = torch.ones((b, f), device=x.device, dtype=torch.long) * (81 - interm_mask.sum(-1).sum(-1))  # future frame is always at index max relative to the current masked set
             pred, pred_regs_ff = self.vit(target_t, context_noised, t, frame_idxs=frame_ids_ff, return_regs=self.reg_latents)
             v_ff_loss = self.v_loss(target, pred, noise, t)
             v_ff_loss_mean = v_ff_loss.mean()
-            
-            # Thinking to future prediction
-            if thinking_frames:
-                context_noised, _ = self.add_noise_ctx(thinking_frames[0], noise=None)
-                frame_ids_tff = torch.cat([frame_ids["thinking"][0], frame_ids["future"]], dim=1)
-                pred, curr_tnk_reg = self.vit(target_t, context_noised, t, frame_idxs=frame_ids_tff, return_regs=self.reg_latents)
-                v_tff_loss = self.v_loss(target, pred, noise, t)
-                v_tff_loss_mean = v_tff_loss.mean()
 
+        # Thinkin part 
+        thinking_frames = x
         # recursive prediction step on the thinking frames
-        tnk_enabled = self.has_thinking and thinking_frames and pred_regs_ff is not None
-        v_losses = [v_nf_loss_mean]
+        tnk_enabled = self.has_thinking and True and pred_regs_ff is not None
+        v_losses = [] #kant nf hena
         if v_ff_loss_mean is not None:
             v_losses.append(v_ff_loss_mean)
         if v_tff_loss_mean is not None:
             v_losses.append(v_tff_loss_mean)
 
-        if tnk_enabled:
+        if tnk_enabled: 
             tnk_regs = []
             v_tnk_losses = []
             curr_tnk_reg = pred_regs_ff[-1].detach()
-
+            
             for i in range(self.num_thinking_steps):
-                context = thinking_frames[i]
-                context_noised, ctx_noise = self.add_noise_ctx(context, noise=None) if context is not None else (None, None)
+                context_noised, ctx_noise = (None, None)
                 block_start, block_end = self.block_intervals[i]
-                frame_ids_tnk = torch.cat([frame_ids["thinking"][i], frame_ids["future"]], dim=1)
+                frame_ids_tnk = torch.ones((b, f), device=x.device, dtype=torch.long) * (mask_sequence.shape[1] - 1 -  frame_ids["thinking"][i])
+                target_t, (noise, _, _, _) = self.add_noise_ctx(target, t=t.reshape(-1), mask=thinking_frames_mask[i].reshape(-1))
                 pred, curr_tnk_reg = self.thoughts_vit(target_t, context_noised, t, frame_idxs=frame_ids_tnk, reg_tokens = curr_tnk_reg, return_regs=self.reg_latents, block_start = block_start, block_end = block_end)
                 curr_tnk_reg = curr_tnk_reg[0]
                 tnk_regs.append(curr_tnk_reg)
-                curr_tnk_reg = curr_tnk_reg.detach()
                 v_tnk_loss = self.v_loss(target, pred, noise, t)
                 v_tnk_losses.append(v_tnk_loss.mean())
-       
+    
             v_losses += v_tnk_losses
             v_losses_mean = sum(v_losses) / len(v_losses)
-
 
             assert len(pred_regs_ff) == len(tnk_regs), "intermediate generated thinking tokens shpould match in length to the feature repr tokens"
             #repr loss 
@@ -745,7 +783,7 @@ class ModelSR(pl.LightningModule):
 
         # Log losses as scalars
         self.log("val/loss", loss.item() if hasattr(loss, "item") else loss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
-        self.log("val/recon_loss", v_nf_loss_mean.item() if hasattr(v_nf_loss_mean, "item") else v_nf_loss_mean, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
+        #self.log("val/recon_loss", v_nf_loss_mean.item() if hasattr(v_nf_loss_mean, "item") else v_nf_loss_mean, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
         if v_ff_loss_mean is not None:
             self.log("val/future_recon_loss", v_ff_loss_mean.item() if hasattr(v_ff_loss_mean, "item") else v_ff_loss_mean, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
         if v_tff_loss_mean is not None:
@@ -828,10 +866,9 @@ class ModelSR(pl.LightningModule):
     def log_images(self, batch, **kwargs):
         log = dict()
         images, frame_rate = self.get_input(batch, 'images')
-        images = images.unsqueeze(1)
         N = min(4, images.size(0))
         images = images[:N]
-
+        images = images.unsqueeze(1)
         total_frames = images.size(1)
         if total_frames == 0:
             raise ValueError("Expected at least one frame per sample for logging.")
@@ -898,328 +935,3 @@ class ModelSR(pl.LightningModule):
         log["sampled"] = sampled
         self.vit.train()
         return log
-    
-    
-    
-
-class ModelSRIF(ModelSR):
-    def __init__(self, *, tokenizer_config, generator_config, adjust_lr_to_batch_size=False, 
-                 sigma_min=1e-5, timescale=1.0, enc_scale=1.89066, enc_scale_dino=3.45062, warmup_steps=5000, min_lr_multiplier=0.1, num_pred_frames=1,
-                 sr_latents=[],
-                add_projector=False,
-                add_norm=True,
-                layer_norm=None,
-                recon_loss_weight=1.0,
-                sr_loss_weight=1.0,
-                ctx_noise_prob=0.5,
-                tube_ctx_mask = True,
-                loss_type = "cos_sim",
-                ctx_noise_exp = 1.0,
-                num_ctx_frames = 4,
-                num_thinking_frames = 4,
-                num_thinking_steps = 4,
-                future_noise_exp = 0.5,
-                repr_loss_weight = 1.0,
-                tnk_loss_weight = 1.0,
-                ema_thoughts = True,
-                predictor_only_sr = False,
-    ):
-
-        super().__init__(
-            tokenizer_config=tokenizer_config,
-            generator_config=generator_config,
-            adjust_lr_to_batch_size=adjust_lr_to_batch_size,
-            sigma_min=sigma_min,
-            timescale=timescale,
-            enc_scale=enc_scale,
-            warmup_steps=warmup_steps,
-            min_lr_multiplier=min_lr_multiplier,
-            num_pred_frames=num_pred_frames,
-            sr_latents=sr_latents,
-            add_projector=add_projector,
-            add_norm=add_norm,
-            layer_norm=layer_norm,
-            recon_loss_weight=recon_loss_weight,
-            sr_loss_weight=sr_loss_weight,
-            ctx_noise_prob=ctx_noise_prob,
-            tube_ctx_mask=tube_ctx_mask,
-            loss_type=loss_type,
-            ctx_noise_exp=ctx_noise_exp,
-            num_ctx_frames=num_ctx_frames,
-            num_thinking_frames=num_thinking_frames,
-            num_thinking_steps=num_thinking_steps,
-            future_noise_exp=future_noise_exp,
-            repr_loss_weight=repr_loss_weight,
-            tnk_loss_weight=tnk_loss_weight,
-            ema_thoughts=ema_thoughts,
-            predictor_only_sr=predictor_only_sr
-        )
-        self.enc_scale_dino = enc_scale_dino
-        
-    
-    def training_step(self, batch, batch_idx):
-        images, frame_rate = self.get_input(batch, 'images')
-        context, thinking_frames, next_frame, future_frame, frame_ids = self.create_context_thinking_pred(images)
-        thinking_frames = thinking_frames or []
-        frame_ids["thinking"] = frame_ids["thinking"] or []
-
-        segments = [context, *thinking_frames, next_frame, future_frame]
-        lengths  = [s.shape[1] if s is not None else 0 for s in segments]
-        starts = list(itertools.accumulate([0, *lengths]))[:-1]
-
-        images_filtered = torch.cat([s for s in segments if s is not None], dim=1)
-
-        x = self.encode_frames(images_filtered)
-
-        pieces = [None if L == 0 else x[:, s:s+L] for s, L in zip(starts, lengths)]
-
-        context = pieces[0]
-        thinking_frames = pieces[1:1+len(thinking_frames)]
-        next_frame = pieces[1+len(thinking_frames)]
-        future_frame = pieces[2+len(thinking_frames)]
-        b, f, e, h, w = x.size()
-
-        v_ff_loss_mean = None
-        v_tff_loss_mean = None
-        pred_regs_ff = None
-        repr_loss_val_mean = 0.0
-        tnk_loss_val_mean = 0.0
-        repr_loss_layers = {}
-
-        # Next frame prediction step 
-        target = next_frame
-        t = torch.rand((x.shape[0],), device=x.device)
-        target_t, noise = self.add_noise(target, t)
-
-        context_noised, ctx_noise = self.add_noise_ctx(context, noise=None) if context is not None else (None, None)
-
-        frame_ids_nf = torch.cat([frame_ids["context"], frame_ids["next"]], dim=1) if context is not None else frame_ids["next"]
-        pred, pred_regs_nf = self.vit(target_t, context_noised, t, frame_idxs=frame_ids_nf, return_regs=self.reg_latents)
-        v_loss = self.v_loss(target, pred, noise, t)
-        v_nf_loss_mean = v_loss.mean()
-        loss_recon_nf, loss_sem_nf = map(lambda x: x.mean(), torch.chunk(v_loss, 2, dim=2))
-
-        # Future frame prediction step 
-        if future_frame is not None:
-            target = future_frame
-            t = torch.rand((x.shape[0],), device=x.device).pow(self.future_noise_exp)
-            target_t, noise = self.add_noise(target, t)
-
-            context_noised, ctx_noise = self.add_noise_ctx(context, noise=None) if context is not None else (None, None)
-
-            frame_ids_ff = torch.cat([frame_ids["context"], frame_ids["future"]], dim=1) if context is not None else frame_ids["future"]
-            pred, pred_regs_ff = self.vit(target_t, context_noised, t, frame_idxs=frame_ids_ff, return_regs=self.reg_latents)
-            v_ff_loss = self.v_loss(target, pred, noise, t)
-            v_ff_loss_mean = v_ff_loss.mean()
-
-            # Thinking to future prediction
-            if thinking_frames:
-                context_noised, _ = self.add_noise_ctx(thinking_frames[0], noise=None)
-                frame_ids_tff = torch.cat([frame_ids["thinking"][0], frame_ids["future"]], dim=1)
-                pred, curr_tnk_reg = self.vit(target_t, context_noised, t, frame_idxs=frame_ids_tff, return_regs=self.reg_latents)
-                v_tff_loss = self.v_loss(target, pred, noise, t)
-                v_tff_loss_mean = v_tff_loss.mean()
-
-        # recursive prediction step on the thinking frames
-        tnk_enabled = self.has_thinking and thinking_frames and pred_regs_ff is not None
-        v_losses = [v_nf_loss_mean]
-        if v_ff_loss_mean is not None:
-            v_losses.append(v_ff_loss_mean)
-        if v_tff_loss_mean is not None:
-            v_losses.append(v_tff_loss_mean)
-
-        if tnk_enabled:
-            tnk_regs = []
-            v_tnk_losses = []
-            curr_tnk_reg = pred_regs_ff[-1].detach()
-            for i in range(self.num_thinking_steps):
-                context = thinking_frames[i]
-                context_noised, ctx_noise = self.add_noise_ctx(context, noise=None) if context is not None else (None, None)
-                block_start, block_end = self.block_intervals[i]
-                frame_ids_tnk = torch.cat([frame_ids["thinking"][i], frame_ids["future"]], dim=1)
-                pred, curr_tnk_reg = self.thoughts_vit(target_t, context_noised, t, frame_idxs=frame_ids_tnk, reg_tokens = curr_tnk_reg, return_regs=self.reg_latents, block_start = block_start, block_end = block_end)
-                curr_tnk_reg = curr_tnk_reg[0]
-                tnk_regs.append(curr_tnk_reg)
-                curr_tnk_reg = curr_tnk_reg.detach()
-                v_tnk_loss = self.v_loss(target, pred, noise, t)
-                v_tnk_losses.append(v_tnk_loss.mean())
-       
-            v_losses += v_tnk_losses
-            v_losses_mean = sum(v_losses) / len(v_losses)
-
-
-            assert len(pred_regs_ff) == len(tnk_regs), "intermediate generated thinking tokens shpould match in length to the feature repr tokens"
-            #repr loss 
-            repr_loss_val, repr_loss_layers = self.sr_loss(pred_regs_ff, tnk_regs, detach_post=False, detach_pred=True)
-            repr_loss_val_mean = repr_loss_val.mean() if hasattr(repr_loss_val, "mean") else repr_loss_val
-            # thinking loss 
-            tnk_loss_val, tnk_loss_layers = self.sr_loss(pred_regs_ff, tnk_regs, detach_post=True, detach_pred=False, detach_pre_pred=self.predictor_only_sr) 
-            tnk_loss_val_mean = tnk_loss_val.mean() if hasattr(tnk_loss_val, "mean") else tnk_loss_val
-        else:
-            v_losses_mean = sum(v_losses) / len(v_losses)
-
-        # Total loss
-        loss = self.recon_loss_weight * v_losses_mean + self.repr_loss_weight * repr_loss_val_mean + self.tnk_loss_weight * tnk_loss_val_mean
-
-        # Log losses as scalars
-        self.log("train/loss", loss.item() if hasattr(loss, "item") else loss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
-        self.log("train/recon_loss", v_nf_loss_mean.item() if hasattr(v_nf_loss_mean, "item") else v_nf_loss_mean, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
-        if v_ff_loss_mean is not None:
-            self.log("train/future_recon_loss", v_ff_loss_mean.item() if hasattr(v_ff_loss_mean, "item") else v_ff_loss_mean, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
-        if v_tff_loss_mean is not None:
-            self.log("train/mfuture_recon_loss", v_tff_loss_mean.item() if hasattr(v_tff_loss_mean, "item") else v_tff_loss_mean, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
-        
-        self.log("train/loss_recon_nf", loss_recon_nf.item() if hasattr(loss_recon_nf, "item") else loss_recon_nf, prog_bar=False, logger=True, on_step=True, on_epoch=True, sync_dist=True)
-        self.log("train/loss_sem_nf", loss_sem_nf.item() if hasattr(loss_sem_nf, "item") else loss_sem_nf, prog_bar=False, logger=True, on_step=True, on_epoch=True, sync_dist=True)
-        if tnk_enabled:
-            self.log("train/sr_loss", repr_loss_val_mean.item() if hasattr(repr_loss_val_mean, "item") else repr_loss_val_mean, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
-            # Log per-layer sr losses
-            for layer_name, layer_val in repr_loss_layers.items():
-                scalar_val = layer_val.item() if hasattr(layer_val, "item") else layer_val
-                self.log(f"train/sr/{layer_name}", scalar_val, prog_bar=False, logger=True, on_step=True, on_epoch=True, sync_dist=True)
-        return loss
-
-    def validation_step(self, batch, batch_idx):
-        images, frame_rate = self.get_input(batch, 'images')
-        context, thinking_frames, next_frame, future_frame, frame_ids = self.create_context_thinking_pred(images)
-        thinking_frames = thinking_frames or []
-        frame_ids["thinking"] = frame_ids["thinking"] or []
-        segments = [context, *thinking_frames, next_frame, future_frame]
-        lengths  = [s.shape[1] if s is not None else 0 for s in segments]
-        starts = list(itertools.accumulate([0, *lengths]))[:-1]
-
-        images_filtered = torch.cat([s for s in segments if s is not None], dim=1)
-
-        x = self.encode_frames(images_filtered)
-
-        pieces = [None if L == 0 else x[:, s:s+L] for s, L in zip(starts, lengths)]
-
-        context = pieces[0]
-        thinking_frames = pieces[1:1+len(thinking_frames)]
-        next_frame = pieces[1+len(thinking_frames)]
-        future_frame = pieces[2+len(thinking_frames)]
-        b, f, e, h, w = x.size()
-
-        v_ff_loss_mean = None
-        v_tff_loss_mean = None
-        pred_regs_ff = None
-        repr_loss_val_mean = 0.0
-        tnk_loss_val_mean = 0.0
-        repr_loss_layers = {}
-
-        target = next_frame
-        t = torch.rand((x.shape[0],), device=x.device)
-        target_t, noise = self.add_noise(target, t)
-        context_noised, _ = self.add_noise_ctx(context, noise=None) if context is not None else (None, None)
-        frame_ids_nf = torch.cat([frame_ids["context"], frame_ids["next"]], dim=1) if context is not None else frame_ids["next"]
-        pred, pred_regs_nf = self.vit(target_t, context_noised, t, frame_idxs=frame_ids_nf, return_regs=self.reg_latents)
-        v_loss = self.v_loss(target, pred, noise, t)
-        v_nf_loss_mean = v_loss.mean()
-        loss_recon_nf, loss_sem_nf = map(lambda x: x.mean(), torch.chunk(v_loss, 2, dim=2))
-
-        if future_frame is not None:
-            target = future_frame
-            t = torch.rand((x.shape[0],), device=x.device).pow(self.future_noise_exp)
-            target_t, noise = self.add_noise(target, t)
-            context_noised, _ = self.add_noise_ctx(context, noise=None) if context is not None else (None, None)
-            frame_ids_ff = torch.cat([frame_ids["context"], frame_ids["future"]], dim=1) if context is not None else frame_ids["future"]
-            pred, pred_regs_ff = self.vit(target_t, context_noised, t, frame_idxs=frame_ids_ff, return_regs=self.reg_latents)
-            v_ff_loss = self.v_loss(target, pred, noise, t)
-            v_ff_loss_mean = v_ff_loss.mean()
-            
-            if thinking_frames:
-                context_noised, _ = self.add_noise_ctx(thinking_frames[0], noise=None)
-                frame_ids_tff = torch.cat([frame_ids["thinking"][0], frame_ids["future"]], dim=1)
-                pred, curr_tnk_reg = self.vit(target_t, context_noised, t, frame_idxs=frame_ids_tff, return_regs=self.reg_latents)
-                v_tff_loss = self.v_loss(target, pred, noise, t)
-                v_tff_loss_mean = v_tff_loss.mean()
-
-        tnk_enabled = self.has_thinking and thinking_frames and pred_regs_ff is not None
-        v_losses = [v_nf_loss_mean]
-        if v_ff_loss_mean is not None:
-            v_losses.append(v_ff_loss_mean)
-        if v_tff_loss_mean is not None:
-            v_losses.append(v_tff_loss_mean)
-
-        if tnk_enabled:
-            tnk_regs = []
-            v_tnk_losses = []
-            curr_tnk_reg = pred_regs_ff[-1].detach()
-            for i in range(self.num_thinking_steps):
-                context_step = thinking_frames[i]
-                context_noised, _ = self.add_noise_ctx(context_step, noise=None) if context_step is not None else (None, None)
-                block_start, block_end = self.block_intervals[i]
-                frame_ids_tnk = torch.cat([frame_ids["thinking"][i], frame_ids["future"]], dim=1)
-                pred, curr_tnk_reg = self.thoughts_vit(target_t, context_noised, t, frame_idxs=frame_ids_tnk, reg_tokens=curr_tnk_reg, return_regs=self.reg_latents, block_start=block_start, block_end=block_end)
-                curr_tnk_reg = curr_tnk_reg[0]
-                tnk_regs.append(curr_tnk_reg)
-                curr_tnk_reg = curr_tnk_reg.detach()
-                v_tnk_loss = self.v_loss(target, pred, noise, t)
-                v_tnk_losses.append(v_tnk_loss.mean())
-
-            v_losses += v_tnk_losses
-            v_losses_mean = sum(v_losses) / len(v_losses)
-
-            assert len(pred_regs_ff) == len(tnk_regs), "intermediate generated thinking tokens shpould match in length to the feature repr tokens"
-            repr_loss_val, repr_loss_layers = self.sr_loss(pred_regs_ff, tnk_regs, detach_post=True, detach_pred=True)
-            repr_loss_val_mean = repr_loss_val.mean() if hasattr(repr_loss_val, "mean") else repr_loss_val
-            tnk_loss_val, tnk_loss_layers = self.sr_loss(pred_regs_ff, tnk_regs, detach_post=True, detach_pred=True, detach_pre_pred=self.predictor_only_sr) 
-            tnk_loss_val_mean = tnk_loss_val.mean() if hasattr(tnk_loss_val, "mean") else tnk_loss_val
-        else:
-            v_losses_mean = sum(v_losses) / len(v_losses)
-
-        loss = self.recon_loss_weight * v_losses_mean + self.repr_loss_weight * repr_loss_val_mean + self.tnk_loss_weight * tnk_loss_val_mean
-
-        self.log("val/loss", loss.item() if hasattr(loss, "item") else loss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
-        self.log("val/recon_loss", v_nf_loss_mean.item() if hasattr(v_nf_loss_mean, "item") else v_nf_loss_mean, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
-        if v_ff_loss_mean is not None:
-            self.log("val/future_recon_loss", v_ff_loss_mean.item() if hasattr(v_ff_loss_mean, "item") else v_ff_loss_mean, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
-        if v_tff_loss_mean is not None:
-            self.log("val/mfuture_recon_loss", v_tff_loss_mean.item() if hasattr(v_tff_loss_mean, "item") else v_tff_loss_mean, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
-        self.log("val/loss_recon", loss_recon_nf.item() if hasattr(loss_recon_nf, "item") else loss_recon_nf, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
-        self.log("val/loss_sem", loss_sem_nf.item() if hasattr(loss_sem_nf, "item") else loss_sem_nf, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
-        if tnk_enabled:
-            self.log("val/sr_loss", repr_loss_val_mean.item() if hasattr(repr_loss_val_mean, "item") else repr_loss_val_mean, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
-            for layer_name, layer_val in repr_loss_layers.items():
-                scalar_val = layer_val.item() if hasattr(layer_val, "item") else layer_val
-                self.log(f"val/sr/{layer_name}", scalar_val, prog_bar=False, logger=True, on_step=True, on_epoch=True, sync_dist=True)
-        return loss
-
-
-    @torch.no_grad()
-    def encode_frames(self, images):
-        if images.ndim == 5:
-            b, f, e, h, w = images.size()
-            images = rearrange(images, 'b f e h w -> (b f) e h w')
-        else:
-            b, e, h, w = images.size()
-            f = 1
-
-        x = self.ae.encode(images)
-        x = x['continuous'] if isinstance(x, dict) else x
-        x0, x1 = x[0] * self.enc_scale, x[1] * self.enc_scale_dino
-        x = torch.cat([x0, x1], dim=1)
-        x = rearrange(x, '(b f) e h w -> b f e h w', b=b, f=f)
-        return x
-
-    @torch.no_grad()
-    def decode_frames(self, x):
-        frame = x[:,0] 
-        half = frame.size(1) // 2
-        frame = torch.cat([
-            frame[:, :half] / self.enc_scale,
-            frame[:, half:] / self.enc_scale_dino
-        ], dim=1)
-        frame = self.ae.post_quant_conv(frame)
-        samples = (self.ae.decoder(frame)).unsqueeze(1)
-        for idx in range(1, x.shape[1]):
-            frame = x[:,idx] 
-            half = frame.size(1) // 2
-            frame = torch.cat([
-                frame[:, :half] / self.enc_scale,
-                frame[:, half:] / self.enc_scale_dino
-            ], dim=1)
-            frame = self.ae.post_quant_conv(frame)
-            frame = self.ae.decoder(frame)
-            samples = torch.cat([samples, (frame).unsqueeze(1)], dim=1)
-        return samples

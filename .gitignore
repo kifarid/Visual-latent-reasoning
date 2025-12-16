@@ -207,5 +207,8 @@ outputs*
 *.csv
 *.zip
 
+
 # Local MNIST Sudoku dataset artifacts
+data/mnist_sudoku/
 datasets/mnist_sudoku/
+

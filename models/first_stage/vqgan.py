@@ -678,6 +678,7 @@ class PatchifyingFirstStage(torch.nn.Module):
         super().__init__()
         self.patch_size = patch_size
         self.enable_patchify = enable_patchify
+        self.post_quant_conv = nn.Identity()
 
     def unpatchify(self, x):
         if not self.enable_patchify:
@@ -711,6 +712,9 @@ class PatchifyingFirstStage(torch.nn.Module):
     def encode(self, x, *args, **kwargs):
         return self.patchify(x)
 
+    def decoder(self, x, *args, **kwargs):
+        return self.unpatchify(x)
+    
     def decode(self, x, *args, **kwargs):
         return self.unpatchify(x)
 
