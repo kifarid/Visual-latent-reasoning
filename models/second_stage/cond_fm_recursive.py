@@ -329,7 +329,7 @@ class ModelSR(pl.LightningModule):
                 patch_size_h, patch_size_w = patch_size[:2]
         else:
             max_patch = self.max_patch_size_second_stage
-            if isinstance(max_patch, (tuple, list)):
+            if isinstance(max_patch, (tuple, list, ListConfig)):
                 if len(max_patch) == 1:
                     max_patch_h = max_patch_w = max_patch[0]
                 else:

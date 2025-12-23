@@ -78,7 +78,7 @@ model:
 data:
   target: data.datamodule.DataModuleFromConfig
   params:
-    batch_size: 16
+    batch_size: 64
     num_workers: 8
     shuffle_val: true
     train:

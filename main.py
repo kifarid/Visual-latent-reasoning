@@ -51,6 +51,7 @@ def get_callbacks(opt, logdir, ckptdir, config, lightning_config, now):
         "log_ckpt_frequency": opt.log_ckpt_frequency,
         "increase_log_steps": opt.increase_log_steps,
         "tsne_epoch_frequency": opt.tsne_epoch_frequency,
+        "log_img_epoch_frequency": opt.log_img_epoch_frequency,
         "bar_refresh_rate": 100 if os.environ.get("SLURM_JOB_ID") else 1,
     }
     
@@ -177,7 +178,7 @@ def get_parser(**parser_kwargs):
     parser.add_argument(
         "--periodic_checkpoint", 
         type=int, 
-        default=1,
+        default=5,
     )
     parser.add_argument(
         "--enable_codebook_usage_logger", 
@@ -202,6 +203,12 @@ def get_parser(**parser_kwargs):
         type=int,
         default=400,
         help="log validation image frequency",
+    )
+    parser.add_argument(
+        "--log_img_epoch_frequency",
+        type=int,
+        default=1,
+        help="log images every n epochs (1 = every epoch)",
     )
     parser.add_argument(
         "--log_ckpt_frequency",

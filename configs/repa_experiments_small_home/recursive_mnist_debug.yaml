@@ -6,29 +6,12 @@ model:
   grad_clip: 1.0
   precision: bf16
   grad_acc_steps: 1
-  target: models.second_stage.fm_recursive_images_sudist_reverse.ModelSR
+  target: models.second_stage.fm_recursive_images_debug.ModelSR
   params:
     # training
     warmup_steps: 2000
     min_lr_multiplier: 0.1
     adjust_lr_to_batch_size: false
-    scheduler_config:
-      target: modules.mask_scheduler.UnconditionalMaskGITScheduler
-      params:
-        default_schedule_mode: arccos
-        default_schedule_mode_train: arccos
-        default_num_steps: 12
-        disable_bar: true
-        num_tokens: 81
-        max_block_size: 3
-        mask_value: -1
-        codebook_size: -1
-    time_sampler_cfg:
-      target: modules.mean_beta.MeanBeta
-      params:
-        scalar_time_sampler: uniform
-        name: mean_beta
-        beta_sharpness: 1.0
     # architecture
     enc_scale: 1
     add_projector: false
@@ -74,7 +57,12 @@ model:
         num_temporal_per_main: 0
         num_reg_tokens: 16
         causal_time_attn: false
-
+    time_sampler_cfg:
+      target: modules.mean_beta.MeanBeta
+      params:
+        scalar_time_sampler: uniform
+        name: mean_beta
+        beta_sharpness: 1.0
 data:
   target: data.datamodule.DataModuleFromConfig
   params:

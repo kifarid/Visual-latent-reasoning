@@ -663,12 +663,11 @@ class DiT(nn.Module):
                 mask = (t >= self.ctx_noise_aug_ratio)
                 aug_noise = torch.randn_like(context)
                 context[mask] = context[mask] + aug_noise[mask] * self.ctx_noise_aug_ratio
-
         x = torch.cat((context, target), dim=1) if context is not None else target
         x = rearrange(x, 'b f c h w -> (b f) c h w')
-        x = self.x_embedder(x) + self.pos_embed.to(x.device)
+        x = self.x_embedder(x) #+ self.pos_embed.to(x.device)
         x = rearrange(x, '(b f) hw c -> b f hw c', b=b)
-        x = x + self.frame_emb[:, self.max_num_frames-(f_target+f_context):].to(x.device) 
+        #x = x + self.frame_emb[:, self.max_num_frames-(f_target+f_context):].to(x.device) 
         return x
 
     def postprocess_outputs(self, out):

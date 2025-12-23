@@ -20,6 +20,7 @@ class ImageLogger(Callback):
         clamp=True,
         increase_log_steps=True,
         val_batch_frequency=None,
+        epoch_frequency=1,
     ):
         super().__init__()
         self.batch_freq_train = batch_frequency
@@ -36,6 +37,8 @@ class ImageLogger(Callback):
             "val": self._build_log_steps(self.batch_freq_val),
         }
         self.clamp = clamp
+        # Gate logging so it only happens every `epoch_frequency` epochs (1 = every epoch).
+        self.epoch_frequency = 1 if epoch_frequency is None else max(1, int(epoch_frequency))
 
     def _build_log_steps(self, freq):
         if freq is None or freq <= 0:
@@ -44,6 +47,9 @@ class ImageLogger(Callback):
             return [freq]
         max_power = int(np.log2(freq)) if freq > 0 else 0
         return [2 ** n for n in range(max_power + 1)]
+
+    def _should_log_epoch(self, current_epoch: int) -> bool:
+        return (current_epoch % self.epoch_frequency) == 0
 
 
     @rank_zero_only
@@ -93,7 +99,9 @@ class ImageLogger(Callback):
 
     
     def log_img(self, pl_module, batch, batch_idx, split="train"):
-        if (self.check_frequency(batch_idx, split) and
+        current_epoch = getattr(pl_module, "current_epoch", 0)
+        if (self._should_log_epoch(current_epoch) and
+                self.check_frequency(batch_idx, split) and
                 hasattr(pl_module, "log_images") and
                 callable(pl_module.log_images) and
                 self.max_images > 0):
@@ -115,7 +123,7 @@ class ImageLogger(Callback):
                         images[k] = torch.clamp(images[k], -1., 1.)
 
             self.log_local(pl_module.logger.save_dir, split, images,
-                           pl_module.global_step, pl_module.current_epoch, batch_idx)
+                           pl_module.global_step, current_epoch, batch_idx)
 
             logger_log_images = self.logger_log_images.get(logger, lambda *args, **kwargs: None)
             logger_log_images(pl_module, images, pl_module.global_step, split)

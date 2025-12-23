@@ -6,7 +6,7 @@ model:
   grad_clip: 1.0
   precision: bf16
   grad_acc_steps: 1
-  target: models.second_stage.fm_recursive_images_sudist_reverse.ModelSR
+  target: models.second_stage.fm_recursive_images_sudist_reverse_imagegen.ModelSR
   params:
     # training
     warmup_steps: 2000

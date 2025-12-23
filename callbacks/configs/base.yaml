@@ -30,6 +30,7 @@ callbacks:
     params:
       batch_frequency: ${log_img_frequency}
       val_batch_frequency: ${log_val_img_frequency}
+      epoch_frequency: ${log_img_epoch_frequency}
       max_images: 8
       clamp: true
       increase_log_steps: ${increase_log_steps}

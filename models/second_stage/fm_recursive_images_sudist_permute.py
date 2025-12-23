@@ -593,7 +593,7 @@ class ModelSR(pl.LightningModule):
             t_masked = torch.where(interm_mask, t, torch.zeros_like(t))
             target_t, (noise, _, _, _) = self.add_noise_ctx(target, t=t_masked.reshape(-1), mask=interm_mask.reshape(-1))
             context_noised, ctx_noise = (None, None)
-            frame_ids_ff = torch.ones((b, f), device=x.device, dtype=torch.long) * (mask_sequence.shape[1] -1)  # future frame is always at index max relative to the current masked set
+            frame_ids_ff = torch.ones((b, f), device=x.device, dtype=torch.long) * (mask_sequence.shape[1] - 1 - interm_idx.unsqueeze(-1))  # future frame is always at index max relative to the current masked set
             pred, pred_regs_ff = self.vit(target_t, context_noised, t_masked, frame_idxs=frame_ids_ff, return_regs=self.reg_latents)
             v_ff_loss = self.v_loss(target, pred, noise, t_masked)
             v_ff_loss_mean = v_ff_loss.mean()
@@ -702,7 +702,7 @@ class ModelSR(pl.LightningModule):
             t_masked = torch.where(interm_mask, t, torch.zeros_like(t))
             target_t, (noise, _, _, _) = self.add_noise_ctx(target, t=t_masked.reshape(-1), mask=interm_mask.reshape(-1))
             context_noised, ctx_noise = (None, None)
-            frame_ids_ff = torch.ones((b, f), device=x.device, dtype=torch.long) * (mask_sequence.shape[1] -1)  # future frame is always at index max relative to the current masked set
+            frame_ids_ff = torch.ones((b, f), device=x.device, dtype=torch.long) * (mask_sequence.shape[1] - 1 - interm_idx.unsqueeze(-1) )  # future frame is always at index max relative to the current masked set
             pred, pred_regs_ff = self.vit(target_t, context_noised, t_masked, frame_idxs=frame_ids_ff, return_regs=self.reg_latents)
             v_ff_loss = self.v_loss(target, pred, noise, t_masked)
             v_ff_loss_mean = v_ff_loss.mean()
@@ -822,7 +822,7 @@ class ModelSR(pl.LightningModule):
         with torch.no_grad():
             for i in range(NFE):
                 t = t_steps_masked[i]
-                neg_v = net(target_t_mask, context, t=t * self.timescale, frame_idxs=frame_ids)
+                neg_v = net(target_t_mask, None, t=t * self.timescale, frame_idxs=frame_ids)
                 dt = t_steps_masked[i] - t_steps_masked[i+1] 
                 dt_up = F.interpolate(dt.float(), size=(input_h, input_w), mode='nearest').bool().unsqueeze(1)
                 dw = torch.randn(target_t.size()).to(target_t.device) * torch.sqrt(dt_up)
@@ -852,7 +852,7 @@ class ModelSR(pl.LightningModule):
         interm_ids = torch.randint(0, mask_sequence.shape[1]-1, (N,), device=mask_sequence.device)
         batch_ids = torch.arange(N, device=mask_sequence.device)
         interm_masks = mask_sequence[batch_ids, interm_ids]  # (B, F_in, H//p_h, W//p_w)
-        frame_ids = torch.ones((N, f), device=images_for_sample.device, dtype=torch.long) * ( mask_sequence.shape[1] -1 - interm_ids.unsqueeze(-1))  # frame ids for the current masked set
+        frame_ids = torch.ones((N, f), device=images_for_sample.device, dtype=torch.long) * ( mask_sequence.shape[1] - 1 - interm_ids.unsqueeze(-1))  # frame ids for the current masked set
         assert interm_masks.ndim == 4
         interm_masks_up = F.interpolate(interm_masks.float(), size=(h, w), mode='nearest').bool() # (B, F_in, 1, H, W)
         edge = interm_masks_up.float() - F.avg_pool2d(interm_masks_up.float(), kernel_size=3, stride=1, padding=1)
@@ -864,7 +864,7 @@ class ModelSR(pl.LightningModule):
         frame_ids_ctx = frame_ids[:, :-self.num_pred_frames] if images_ctx is not None else None
 
         # sample
-        samples = self.sample(images_for_sample, mask=interm_masks, eta=0.0, NFE=30, frame_ids=frame_ids_ctx, sample_with_ema=False, num_samples=N, return_sample=True)[1]
+        samples = self.sample(images_for_sample, mask=interm_masks, eta=0.0, NFE=30, frame_ids=frame_ids, sample_with_ema=False, num_samples=N, return_sample=True)[1]
 
         # Only keep the first generated frame
         samples = samples[:N]
@@ -879,7 +879,7 @@ class ModelSR(pl.LightningModule):
         sampled = vutils.make_grid(sampled, nrow=N, padding=2, normalize=False,)
         
         # sample
-        samples_ema = self.sample(images_for_sample, mask=interm_masks, eta=0.0, NFE=30, frame_ids=frame_ids_ctx, sample_with_ema=True, num_samples=N, return_sample=True)[1]
+        samples_ema = self.sample(images_for_sample, mask=interm_masks, eta=0.0, NFE=30, frame_ids=frame_ids, sample_with_ema=True, num_samples=N, return_sample=True)[1]
         # Only keep the first generated frame
         samples_ema = samples_ema[:N]
         samples_ema[edge>0] = 1.0  # highlight the edges of the mask
