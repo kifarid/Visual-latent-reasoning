@@ -6,7 +6,7 @@ model:
   grad_clip: 1.0
   precision: bf16
   grad_acc_steps: 1
-  target: models.second_stage.fm_recursive_images_debug.ModelSR
+  target: models.second_stage.fm_recursive_images_x.ModelSR
   params:
     # training
     warmup_steps: 500
@@ -21,12 +21,12 @@ model:
     tnk_loss_weight: 0.0
     loss_type: cos_sim
     ctx_noise_exp: 1.0
-    future_noise_exp: 0.5
+    future_noise_exp: 1.0
     # frame layout (single-frame generation)
     num_ctx_frames: 0
     num_pred_frames: 1
-    num_thinking_frames: 0
-    num_thinking_steps: 0
+    num_thinking_frames: 1
+    num_thinking_steps: 16
     # second-stage patching: 28x28 → 9x9 tokens on 252x252 grids
     max_patch_size_second_stage:
       - 28
@@ -40,7 +40,7 @@ model:
       params:
         max_num_frames: 81
         hidden_size: 1152
-        depth: 32
+        depth: 64
         num_heads: 16
         mlp_ratio: 4
         patch_size: 28
@@ -57,6 +57,7 @@ model:
         num_temporal_per_main: 0
         num_reg_tokens: 16
         causal_time_attn: false
+        inner_depth: 4
     time_sampler_cfg:
       target: modules.mean_beta.MeanBeta
       params:

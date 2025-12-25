@@ -32,8 +32,34 @@ def rand_visible_grid_mask(B, S, H, W, max_visible=5):
     ranks = order.new_empty(order.shape)
     ranks.scatter_(1, order, torch.arange(HW).expand(B, HW))
 
-    mask = (ranks < k).view(B, 1, H, W).expand(B, S, H, W)            # [B,S,H,W]
+    mask = (ranks >= k).view(B, 1, H, W).expand(B, S, H, W)            # [B,S,H,W]
     return mask, k.squeeze(1)                                         # also returns how many kept
+
+
+def _kl_diag_gauss(params_p, params_q, chunk_dim=-1, clamp=(-30.0, 20.0)):
+    """
+    KL( P || Q ) for diagonal Gaussians with concatenated (mean, logvar).
+
+    params_* : (..., 2*C, ...) but concatenated along `chunk_dim`
+              batch dim must be dim=0.
+    Returns: (B,) KL per sample.
+    """
+    p_mean, p_logvar = torch.chunk(params_p, 2, dim=chunk_dim)
+    q_mean, q_logvar = torch.chunk(params_q, 2, dim=chunk_dim)
+
+    p_logvar = torch.clamp(p_logvar, clamp[0], clamp[1])
+    q_logvar = torch.clamp(q_logvar, clamp[0], clamp[1])
+
+    # Avoid zero variance to keep KL stable
+    var_eps = 1e-8
+    p_var = torch.exp(p_logvar).clamp_min(var_eps)
+    q_var = torch.exp(q_logvar).clamp_min(var_eps)
+
+    # KL(P||Q) = 0.5 * sum( log(q_var/p_var) + (p_var + (p_mean-q_mean)^2)/q_var - 1 )
+    kl_elem = 0.5 * (q_logvar - p_logvar + (p_var + (p_mean - q_mean).pow(2)) / q_var - 1.0)
+
+    # sum over all dims except batch
+    return kl_elem.flatten(1).sum(dim=1)
 
 
 @torch.no_grad()
@@ -78,6 +104,8 @@ class ModelSR(pl.LightningModule):
                 layer_norm=None,
                 recon_loss_weight=1.0,
                 sr_loss_weight=1.0,
+                kl_weight=0.0,
+                sr_loss_start_step=0,
                 ctx_noise_prob=0.5,
                 tube_ctx_mask = True,
                 max_patch_size_second_stage = (6, 16),
@@ -93,8 +121,6 @@ class ModelSR(pl.LightningModule):
                 ema_thoughts = True, 
                 predictor_only_sr = False,
                 time_sampler_cfg = None,
-                #learning_rate = 1e-4,
-                #num_iters_per_epoch = 1,
                 
     ):
         super().__init__()
@@ -134,6 +160,8 @@ class ModelSR(pl.LightningModule):
         self.layer_norm = layer_norm
         self.recon_loss_weight = recon_loss_weight
         self.sr_loss_weight = sr_loss_weight
+        self.kl_weight = kl_weight
+        self.sr_loss_start_step = sr_loss_start_step
         self.repr_loss_weight = repr_loss_weight
         self.tnk_loss_weight = tnk_loss_weight
         self.ctx_noise_exp =ctx_noise_exp
@@ -457,28 +485,21 @@ class ModelSR(pl.LightningModule):
         loss = ((pred.float() - v.float()) ** 2)
         return loss
 
-    def x_loss(self, target, pred):
-        """
-        Docstring for x_loss
-        
-        :param self: Description
-        :param target: The actual signal X_0 to predict
-        :param pred: Xhat_0
-        :param t: Description
-        """
-        loss = ((pred.float()-target.float())**2)
+    def x_loss(self, target, pred, noise, t):
+        loss = ((pred.float() - target.float()) ** 2)
         return loss 
 
-    def x_to_v(self, x, z, t, eps=1e-6):
-        v_pred = (x - z)/ (1 -t + eps)
-        return  v_pred
-        
-    
     def sr_loss(self, pred_latents, post_latents, detach_pred= True, detach_post= True, detach_pre_pred= False):
         if len(self.reg_latents) == 0 or len(pred_latents) == 0:
             return 0.0, {}
         sr_loss = 0
         sr_loss_layer = {}
+
+        kl_weight = getattr(self, "kl_weight", 0.0)
+        kl_enabled = kl_weight > 0
+        kl_dir = "post||pred"   # "post||pred" or "pred||post"
+        kl_chunk_dim = -1  # -1 if last dim is 2C, 1 if channel dim is 2C
+
         for i in range(len(pred_latents)):
             pred_latent, post_latent = pred_latents[i], post_latents[i]
             pred_latent = pred_latent.detach() if detach_pre_pred else pred_latent
@@ -488,16 +509,31 @@ class ModelSR(pl.LightningModule):
             
             post_latent = post_latent.detach() if detach_post else post_latent
             pred_latent = pred_latent.detach() if detach_pred else pred_latent
-            sr_loss_layer_unred = 0
+            
+            # If we're using KL, treat MSE/cos as *mean-only* match, KL handles uncertainty.
+            if kl_enabled:
+                pred_mu, _ = torch.chunk(pred_latent, 2, dim=kl_chunk_dim)
+                post_mu, _ = torch.chunk(post_latent, 2, dim=kl_chunk_dim)
+                point_pred, point_post = pred_mu, post_mu
+            else:
+                point_pred, point_post = pred_latent, post_latent
+            
+            sr_loss_layer_unred = point_pred.new_tensor(0.)
             # Compute MSE loss if requested
             if self.loss_type in ["mse", "both"]:
-                sr_loss_layer_unred = sr_loss_layer_unred + F.mse_loss(pred_latent, post_latent, reduction='none')
+                sr_loss_layer_unred = sr_loss_layer_unred + F.mse_loss(point_pred, point_post, reduction='none')
             # Compute cosine similarity loss if requested
             if self.loss_type in ["cos_sim", "both"]:
-                sr_loss_layer_unred = sr_loss_layer_unred + (1 - F.cosine_similarity(pred_latent, post_latent, dim=-1, eps=1e-8))
+                sr_loss_layer_unred = sr_loss_layer_unred + (1 - F.cosine_similarity(point_pred, point_post, dim=-1, eps=1e-8))
             sr_loss_layer_red = sr_loss_layer_unred.mean()
             sr_loss_layer[f"layer_{self.reg_latents[i]}"] = sr_loss_layer_red
             sr_loss += sr_loss_layer_red
+
+            if kl_enabled:
+                kl = _kl_diag_gauss(post_latent, pred_latent, chunk_dim=kl_chunk_dim)  # (B,)
+                kl = kl.mean()
+                sr_loss += kl_weight * kl
+                sr_loss_layer[f"layer_{self.reg_latents[i]}_kl"] = kl
 
         sr_loss = sr_loss / len(self.reg_latents)
         return sr_loss, sr_loss_layer
@@ -610,28 +646,10 @@ class ModelSR(pl.LightningModule):
         context_noised, ctx_noise = (None, None)
 
         frame_ids_nf = torch.ones((b, f), device=x.device, dtype=torch.long) 
-        pred, pred_regs_nf = self.vit(target_t, context_noised, t, frame_idxs=frame_ids_nf, return_regs=self.reg_latents)
+        pred, pred_regs_ff = self.vit(target_t, context_noised, t, frame_idxs=frame_ids_nf, return_regs=self.reg_latents)
 
-        v_loss = self.x_loss(target, pred) #, noise, t)
+        v_loss = self.x_loss(target, pred, noise, t)
         v_nf_loss_mean = v_loss.mean()
-        #loss_recon_nf, loss_sem_nf = map(lambda x: x.mean(), torch.chunk(v_loss, 2, dim=2))
-
-        # Future frame prediction step 
-        future_frame = next_frame
-        if future_frame is not None:
-            target = next_frame
-            t = torch.rand((x.shape[0],), device=x.device).pow(self.future_noise_exp)
-            target_t, noise = self.add_noise(target, t)
-
-            context_noised, ctx_noise =  (None, None)
-
-            frame_ids_ff = torch.cat([frame_ids["context"], frame_ids["future"]], dim=1) if context is not None else frame_ids["future"]
-            pred, pred_regs_ff = self.vit(target_t, context_noised, t, frame_idxs=frame_ids_ff, return_regs=self.reg_latents)
-            v_ff_loss = self.x_loss(target, pred) #, noise, t)
-            v_ff_loss_mean = v_ff_loss.mean()
-    
-
-
 
         # recursive prediction step on the thinking frames
         tnk_enabled = self.has_thinking and thinking_frames and pred_regs_ff is not None
@@ -645,11 +663,17 @@ class ModelSR(pl.LightningModule):
         if tnk_enabled: 
                 tnk_regs = []
                 v_tnk_losses = []
-                curr_tnk_reg = pred_regs_ff[-1].detach() if torch.rand(1).item() < 0.5 else None
+                curr_tnk_reg = None #pred_regs_ff[-1].detach() if torch.rand(1).item() < 0.01 else None
+                mask_labels = torch.randint(
+                    low=0,
+                    high=self.num_thinking_steps,
+                    size=(b, f, *self.vit.x_embedder.grid_size),
+                    device=x.device,
+                )
                 
                 for i in range(self.num_thinking_steps):
                     t = self.time_sampler.get_time(b).to(x.device) #torch.rand((x.shape[0],), device=x.device)[:,None, None, None].expand(b, f, *self.vit.x_embedder.grid_size)
-                    interm_mask = torch.ones((b, f, *self.vit.x_embedder.grid_size), device=x.device, dtype=torch.bool)
+                    interm_mask = (mask_labels != i)
                     context_noised, ctx_noise = (None, None)
                     block_start, block_end = self.block_intervals[i]
                     t_masked = torch.where(interm_mask, t, torch.zeros_like(t))
@@ -659,8 +683,8 @@ class ModelSR(pl.LightningModule):
                     curr_tnk_reg = curr_tnk_reg[0]
                     tnk_regs.append(curr_tnk_reg)
                     if i//2 == 1:
-                        curr_tnk_reg = curr_tnk_reg.detach() if torch.rand(1).item() < 0.5 else None
-                    v_tnk_loss = self.x_loss(target, pred) #, noise, t)
+                        curr_tnk_reg = curr_tnk_reg.detach() if torch.rand(1).item() < 0.9 else None
+                    v_tnk_loss = self.x_loss(target, pred, noise, t)
                     v_tnk_losses.append(v_tnk_loss.mean())
         
                 v_losses += v_tnk_losses
@@ -677,8 +701,11 @@ class ModelSR(pl.LightningModule):
         else:
             v_losses_mean = sum(v_losses) / len(v_losses)
 
-        # Total loss
-        loss = self.recon_loss_weight * v_losses_mean + self.repr_loss_weight * repr_loss_val_mean + self.tnk_loss_weight * tnk_loss_val_mean
+        # Total loss with optional warmup for sr/tnk components
+        sr_weight = 1.0 if self.global_step >= self.sr_loss_start_step else 0.0
+        loss = (self.recon_loss_weight * v_losses_mean
+                + sr_weight * self.repr_loss_weight * repr_loss_val_mean
+                + sr_weight * self.tnk_loss_weight * tnk_loss_val_mean)
 
         # Log losses as scalars
         self.log("train/loss", loss.item() if hasattr(loss, "item") else loss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
@@ -743,26 +770,11 @@ class ModelSR(pl.LightningModule):
         context_noised, ctx_noise = (None, None)
 
         frame_ids_nf = torch.ones((b, f), device=x.device, dtype=torch.long) 
-        pred, pred_regs_nf = self.vit(target_t, context_noised, t_masked, frame_idxs=frame_ids_nf, return_regs=self.reg_latents)
+        pred, pred_regs_ff = self.vit(target_t, context_noised, t_masked, frame_idxs=frame_ids_nf, return_regs=self.reg_latents)
 
-        v_loss = self.x_loss(target, pred) #, noise, t_masked)
+        v_loss = self.x_loss(target, pred, noise, t_masked)
         v_nf_loss_mean = v_loss.mean()
-        #loss_recon_nf, loss_sem_nf = map(lambda x: x.mean(), torch.chunk(v_loss, 2, dim=2))
 
-        # Future frame prediction step 
-        future_frame = next_frame
-        if future_frame is not None:
-            target = future_frame
-            t = torch.rand((x.shape[0],), device=x.device) #.pow(self.future_noise_exp)
-            target_t, noise = self.add_noise(target, t)
-
-            context_noised, ctx_noise = self.add_noise_ctx(context, noise=None) if context is not None else (None, None)
-
-            frame_ids_ff =  torch.ones((b, f), device=x.device, dtype=torch.long)  #torch.cat([frame_ids["context"], frame_ids["future"]], dim=1) if context is not None else frame_ids["future"]
-            pred, pred_regs_ff = self.vit(target_t, context_noised, t, frame_idxs=frame_ids_ff, return_regs=self.reg_latents)
-            v_ff_loss = self.x_loss(target, pred) #, noise, t)
-            v_ff_loss_mean = v_ff_loss.mean()
-    
 
         # recursive prediction step on the thinking frames
         tnk_enabled = self.has_thinking and thinking_frames and pred_regs_ff is not None
@@ -772,15 +784,21 @@ class ModelSR(pl.LightningModule):
         if v_tff_loss_mean is not None:
             v_losses.append(v_tff_loss_mean)
 
-                #reverse thinking steps
+        #reverse thinking steps
         if tnk_enabled: 
             tnk_regs = []
             v_tnk_losses = []
-            curr_tnk_reg = pred_regs_ff[-1].detach() if torch.rand(1).item() < 0.5 else None
+            curr_tnk_reg = None #pred_regs_ff[-1].detach() if torch.rand(1).item() < 0.01 else None
+            mask_labels = torch.randint(
+                low=0,
+                high=self.num_thinking_steps,
+                size=(b, f, *self.vit.x_embedder.grid_size),
+                device=x.device,
+            )
             
             for i in range(self.num_thinking_steps):
                 t = self.time_sampler.get_time(b).to(x.device) #torch.rand((x.shape[0],), device=x.device)[:,None, None, None].expand(b, f, *self.vit.x_embedder.grid_size)
-                interm_mask = torch.ones((b, f, *self.vit.x_embedder.grid_size), device=x.device, dtype=torch.bool)
+                interm_mask = (mask_labels != i)
                 context_noised, ctx_noise = (None, None)
                 block_start, block_end = self.block_intervals[i]
                 t_masked = torch.where(interm_mask, t, torch.zeros_like(t))
@@ -789,7 +807,7 @@ class ModelSR(pl.LightningModule):
                 pred, curr_tnk_reg = self.thoughts_vit(target_t, context_noised, t_masked, frame_idxs=frame_ids_tnk, reg_tokens = curr_tnk_reg, return_regs=self.reg_latents, block_start = block_start, block_end = block_end)
                 curr_tnk_reg = curr_tnk_reg[0]
                 tnk_regs.append(curr_tnk_reg)
-                v_tnk_loss = self.x_loss(target, pred) #, noise, t)
+                v_tnk_loss = self.x_loss(target, pred, noise, t)
                 v_tnk_losses.append(v_tnk_loss.mean())
     
             v_losses += v_tnk_losses
@@ -801,8 +819,11 @@ class ModelSR(pl.LightningModule):
         else:
             v_losses_mean = sum(v_losses) / len(v_losses)
 
-        # Total loss
-        loss = self.recon_loss_weight * v_losses_mean + self.repr_loss_weight * repr_loss_val_mean + self.tnk_loss_weight * tnk_loss_val_mean
+        # Total loss with optional warmup for sr/tnk components
+        sr_weight = 1.0 if self.global_step >= self.sr_loss_start_step else 0.0
+        loss = (self.recon_loss_weight * v_losses_mean
+                + sr_weight * self.repr_loss_weight * repr_loss_val_mean
+                + sr_weight * self.tnk_loss_weight * tnk_loss_val_mean)
         # Log losses as scalars
         self.log("val/loss", loss.item() if hasattr(loss, "item") else loss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
         self.log("val/recon_loss", v_nf_loss_mean.item() if hasattr(v_nf_loss_mean, "item") else v_nf_loss_mean, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
@@ -859,8 +880,11 @@ class ModelSR(pl.LightningModule):
                 b, f, e, h, w = context.size()
             else:
                 context = images.clone()
-        else:
-            context = None
+
+        
+        context = None
+        images_encoded = self.encode_frames(images) 
+        
 
         if frame_rate is None:
             frame_rate = torch.full_like( torch.ones((num_samples,)), 5, device=device)
@@ -869,25 +893,27 @@ class ModelSR(pl.LightningModule):
         target_t = torch.randn(num_samples, self.num_pred_frames, self.vit.in_channels, input_h, input_w, device=device)
         t_steps = torch.linspace(1, 0, NFE + 1, device=device)
         t_steps = t_steps[:, None, None, None, None].repeat(t_steps.size(0), num_samples, self.num_pred_frames, *self.vit.x_embedder.grid_size)
-        t_steps = torch.where(torch.ones_like(mask[None, :]), t_steps, torch.zeros_like(t_steps)) 
-        
+        t_steps = torch.where(mask[None, :], t_steps, torch.zeros_like(t_steps)) 
+        mask_up = F.interpolate(mask.float(), size=(h, w), mode='nearest')
+        target_t_masked = torch.where(mask_up.bool().unsqueeze(2), target_t, images_encoded) if mask_up is not None else target_t
         with torch.no_grad():
             for i in range(NFE):
                 t = t_steps[i]#.repeat(target_t.shape[0]) #t_steps_masked[i] 
-                x_pred = net(target_t, context, t=t * self.timescale, frame_idxs=frame_ids)
-                t_up = F.interpolate(t.float(), size=(input_h, input_w), mode='nearest').unsqueeze(2)
-                v_pred = - (x_pred - target_t) / (1 - t_up).clamp_min(0.005)
-                neg_v = - v_pred
+                x_pred = net(target_t_masked, context, t=t * self.timescale, frame_idxs=frame_ids)
+
                 dt = t_steps[i] - t_steps[i+1] #t_steps_masked[i] - t_steps_masked[i+1] # 
                 dt_up = F.interpolate(dt.float(), size=(input_h, input_w), mode='nearest').unsqueeze(2)
-                dw = torch.randn(target_t.size()).to(target_t.device) * torch.sqrt(dt_up.float())
+                t_up = F.interpolate(t_steps[i].float(), size=(input_h, input_w), mode='nearest').unsqueeze(2)
+                v_pred = - (x_pred - target_t_masked) / (1 - t_up).clamp_min(0.005)
+                neg_v = - v_pred
+                dw = torch.randn(target_t_masked.size()).to(target_t.device) * torch.sqrt(dt_up.float())
                 diffusion = dt_up
-                target_t  = target_t + neg_v * dt_up + eta *  torch.sqrt(2 * diffusion) * dw
+                target_t_masked  = target_t_masked + neg_v * dt_up + eta *  torch.sqrt(2 * diffusion) * dw
         if return_sample:
-            images = self.decode_frames(target_t.clone())
-            return target_t, images
+            images = self.decode_frames(target_t_masked.clone())
+            return target_t_masked, images
         else:
-            return target_t
+            return target_t_masked
 
     @torch.no_grad()
     def log_images(self, batch, **kwargs):
@@ -926,10 +952,10 @@ class ModelSR(pl.LightningModule):
         b, f, e, h, w = images_for_sample.size()
         
         # sample mask with random ratio of 0 to 20 numbers seen/unmasked 
-        mask, _ = rand_visible_grid_mask(N, f, *self.vit.x_embedder.grid_size, max_visible=5)
+        mask, _ = rand_visible_grid_mask(N, f, *self.vit.x_embedder.grid_size, max_visible=20)
         mask = mask.to(device=images_for_sample.device)
         mask_up = F.interpolate(mask.float(), size=(h, w), mode='nearest')
-        mask_overlay = (1.0 - 2.0 * mask_up).unsqueeze(2).to(dtype=images_for_sample.dtype)
+        mask_overlay = (2.0 * mask_up - 1.0).unsqueeze(2).to(dtype=images_for_sample.dtype)
         masked_images_for_sample = torch.clamp(images_for_sample*mask_overlay, -1.0, 1.0)
 
         images_ctx = images_for_sample[:, :-self.num_pred_frames] if f - self.num_pred_frames > 0 else None
@@ -939,7 +965,7 @@ class ModelSR(pl.LightningModule):
         l_visual_recon_ema = [masked_images_for_sample[:, frame_idx] for frame_idx in range(f)]
 
         # sample
-        samples = self.sample(images_ctx, mask=mask, eta=0.0, NFE=30, frame_ids=frame_ids_ctx, sample_with_ema=False, num_samples=N, return_sample=True)[1]
+        samples = self.sample(images_for_sample, mask=mask, eta=0.0, NFE=30, frame_ids=frame_ids_ctx, sample_with_ema=False, num_samples=N, return_sample=True)[1]
 
         # Only keep the first generated frame
         samples = samples[:N]
@@ -954,7 +980,7 @@ class ModelSR(pl.LightningModule):
         sampled = vutils.make_grid(sampled, nrow=N, padding=2, normalize=False,)
         
         # sample
-        samples_ema = self.sample(images_ctx, mask=mask, eta=0.0, NFE=30, frame_ids=frame_ids_ctx, sample_with_ema=True, num_samples=N, return_sample=True)[1]
+        samples_ema = self.sample(images_for_sample, mask=mask, eta=0.0, NFE=30, frame_ids=frame_ids_ctx, sample_with_ema=True, num_samples=N, return_sample=True)[1]
         # Only keep the first generated frame
         samples_ema = samples_ema[:N]
         samples_ema_masked = torch.clamp(samples_ema*mask_overlay, -1.0, 1.0)

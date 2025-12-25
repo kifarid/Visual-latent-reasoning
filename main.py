@@ -52,6 +52,7 @@ def get_callbacks(opt, logdir, ckptdir, config, lightning_config, now):
         "increase_log_steps": opt.increase_log_steps,
         "tsne_epoch_frequency": opt.tsne_epoch_frequency,
         "log_img_epoch_frequency": opt.log_img_epoch_frequency,
+        "save_on_train_epoch_end": opt.save_on_train_epoch_end,
         "bar_refresh_rate": 100 if os.environ.get("SLURM_JOB_ID") else 1,
     }
     
@@ -179,6 +180,14 @@ def get_parser(**parser_kwargs):
         "--periodic_checkpoint", 
         type=int, 
         default=5,
+    )
+    parser.add_argument(
+        "--save_on_train_epoch_end",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=True,
+        help="If true, ModelCheckpoint saves at the end of every train epoch.",
     )
     parser.add_argument(
         "--enable_codebook_usage_logger", 

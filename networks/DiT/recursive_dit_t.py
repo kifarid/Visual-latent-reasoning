@@ -738,6 +738,7 @@ class FlexDiT(DiT):
         num_temporal_per_main=1,
         num_reg_tokens=0,
         causal_time_attn=False,
+        inner_depth=None,
         **kwargs,
     ):
         """
@@ -746,6 +747,8 @@ class FlexDiT(DiT):
             num_spatial_per_main: number of spatial-only FlexDiTBlocks to run after each main block.
             num_temporal_per_main: number of temporal-only FlexDiTBlocks to run after each main block.
             num_reg_tokens: number of register tokens prepended in main blocks (uses AttentionRope prefix slots).
+            inner_depth: number of unique blocks; total depth must be a multiple of this value.
+                If None, defaults to depth (no repetition). Effective repeats = depth // inner_depth.
         """
         self.hidden_size = hidden_size
         self.num_reg_tokens = int(num_reg_tokens)
@@ -768,7 +771,19 @@ class FlexDiT(DiT):
             **kwargs,
         )
 
-        self.depth = depth
+        # Discard the base DiT block stack (we build custom blocks below).
+        self.blocks = nn.ModuleList()
+
+        self.depth = int(depth)
+        if inner_depth is None:
+            self.inner_depth = self.depth
+        else:
+            self.inner_depth = int(inner_depth)  # number of unique layers
+        if self.inner_depth < 1:
+            raise ValueError("inner_depth must be >= 1.")
+        if self.depth % self.inner_depth != 0:
+            raise ValueError("depth must be divisible by inner_depth.")
+        self.block_repeats = self.depth // self.inner_depth  # effective repeat count
         grid_h, grid_w = self.x_embedder.grid_size
         self.rope = RotaryEmbedding3D(
             dim=hidden_size//num_heads,
@@ -799,18 +814,18 @@ class FlexDiT(DiT):
             )
 
         self.main_blocks = nn.ModuleList(
-            [_make_block(num_prefix_tokens=self.num_reg_tokens) for _ in range(depth)]
+            [_make_block(num_prefix_tokens=self.num_reg_tokens) for _ in range(self.inner_depth)]
         )
         self.spatial_blocks = (
             nn.ModuleList(
-                [nn.ModuleList([_make_block(num_prefix_tokens=self.num_reg_tokens) for _ in range(self.num_spatial_per_main)]) for _ in range(depth)]
+                [nn.ModuleList([_make_block(num_prefix_tokens=self.num_reg_tokens) for _ in range(self.num_spatial_per_main)]) for _ in range(self.inner_depth)]
             )
             if self.num_spatial_per_main > 0
             else None
         )
         self.temporal_blocks = (
             nn.ModuleList(
-                [nn.ModuleList([_make_block(num_prefix_tokens=self.num_reg_tokens) for _ in range(self.num_temporal_per_main)]) for _ in range(depth)]
+                [nn.ModuleList([_make_block(num_prefix_tokens=self.num_reg_tokens) for _ in range(self.num_temporal_per_main)]) for _ in range(self.inner_depth)]
             )
             if self.num_temporal_per_main > 0
             else None
@@ -865,14 +880,15 @@ class FlexDiT(DiT):
                 raise ValueError(f"Provided reg_tokens must have {expected} tokens.")
 
         for idx in self._block_indices():
-            x, reg_tokens = self.main_blocks[idx](x, frame_indices, self.rope, self.main_block_mode, c, reg_tokens)
+            block_idx = idx % self.inner_depth  # reuse inner_depth block set across repeats
+            x, reg_tokens = self.main_blocks[block_idx](x, frame_indices, self.rope, self.main_block_mode, c, reg_tokens)
 
             if self.num_spatial_per_main > 0:
-                for block in self.spatial_blocks[idx]:
+                for block in self.spatial_blocks[block_idx]:
                     x, reg_tokens = block(x, frame_indices, self.rope, "s", c, reg_tokens)
 
             if self.num_temporal_per_main > 0:
-                for block in self.temporal_blocks[idx]:
+                for block in self.temporal_blocks[block_idx]:
                     x, reg_tokens = block(x, frame_indices, self.rope, "t", c, reg_tokens)
 
             if idx in return_latents:
@@ -923,6 +939,7 @@ class RecursiveDiT(FlexDiT):
         num_temporal_per_main=1,
         num_reg_tokens=0,
         causal_time_attn=False,
+        inner_depth=None,
         **kwargs,
     ):
         super().__init__(
@@ -943,6 +960,7 @@ class RecursiveDiT(FlexDiT):
             num_temporal_per_main=num_temporal_per_main,
             num_reg_tokens=num_reg_tokens,
             causal_time_attn=causal_time_attn,
+            inner_depth=inner_depth,
             **kwargs,
         )
         self._default_block_range = (0, self.depth - 1)

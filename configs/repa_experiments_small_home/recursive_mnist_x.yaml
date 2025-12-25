@@ -6,7 +6,7 @@ model:
   grad_clip: 1.0
   precision: bf16
   grad_acc_steps: 1
-  target: models.second_stage.fm_recursive_images_debug.ModelSR
+  target: models.second_stage.fm_recursive_images_x.ModelSR
   params:
     # training
     warmup_steps: 500
@@ -18,7 +18,7 @@ model:
     add_norm: false
     ema_thoughts: false
     repr_loss_weight: 0.0
-    tnk_loss_weight: 0.0
+    tnk_loss_weight: 1.0
     loss_type: cos_sim
     ctx_noise_exp: 1.0
     future_noise_exp: 0.5
@@ -39,9 +39,9 @@ model:
       target: networks.DiT.recursive_dit_t.RecursiveDiT
       params:
         max_num_frames: 81
-        hidden_size: 1152
+        hidden_size: 864
         depth: 32
-        num_heads: 16
+        num_heads: 12
         mlp_ratio: 4
         patch_size: 28
         input_size:
@@ -80,9 +80,6 @@ data:
         to_rgb: true
         allow_synthetic_if_missing: true
         test_samples_num: 0 
-        subset_size: 10
-        repeat_factor: 10000
-
     validation:
       target: data.mnist_sudoku.MnistSudokuGridDataset
       params:
@@ -94,5 +91,3 @@ data:
         to_rgb: true
         allow_synthetic_if_missing: true
         test_samples_num: 0 
-        subset_size: 10
-        repeat_factor: 10000

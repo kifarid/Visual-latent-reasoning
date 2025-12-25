@@ -36,6 +36,32 @@ def rand_visible_grid_mask(B, S, H, W, max_visible=5):
     return mask, k.squeeze(1)                                         # also returns how many kept
 
 
+def _kl_diag_gauss(params_p, params_q, chunk_dim=-1, clamp=(-30.0, 20.0)):
+    """
+    KL( P || Q ) for diagonal Gaussians with concatenated (mean, logvar).
+
+    params_* : (..., 2*C, ...) but concatenated along `chunk_dim`
+              batch dim must be dim=0.
+    Returns: (B,) KL per sample.
+    """
+    p_mean, p_logvar = torch.chunk(params_p, 2, dim=chunk_dim)
+    q_mean, q_logvar = torch.chunk(params_q, 2, dim=chunk_dim)
+
+    p_logvar = torch.clamp(p_logvar, clamp[0], clamp[1])
+    q_logvar = torch.clamp(q_logvar, clamp[0], clamp[1])
+
+    # Avoid zero variance to keep KL stable
+    var_eps = 1e-8
+    p_var = torch.exp(p_logvar).clamp_min(var_eps)
+    q_var = torch.exp(q_logvar).clamp_min(var_eps)
+
+    # KL(P||Q) = 0.5 * sum( log(q_var/p_var) + (p_var + (p_mean-q_mean)^2)/q_var - 1 )
+    kl_elem = 0.5 * (q_logvar - p_logvar + (p_var + (p_mean - q_mean).pow(2)) / q_var - 1.0)
+
+    # sum over all dims except batch
+    return kl_elem.flatten(1).sum(dim=1)
+
+
 @torch.no_grad()
 def update_ema(ema_model, model, decay=0.9999):
     """
@@ -846,7 +872,7 @@ class ModelSR(pl.LightningModule):
             else:
                 context = images.clone()
 
-        
+        images_encoded = self.encode_frames(images) 
         context = None
 
         if frame_rate is None:
@@ -858,8 +884,7 @@ class ModelSR(pl.LightningModule):
         t_steps = t_steps[:, None, None, None, None].repeat(t_steps.size(0), num_samples, self.num_pred_frames, *self.vit.x_embedder.grid_size)
         t_steps = torch.where(mask[None, :], t_steps, torch.zeros_like(t_steps)) 
         mask_up = F.interpolate(mask.float(), size=(h, w), mode='nearest')
-        print(mask_up.shape)
-        target_t_masked = torch.where(mask_up.bool().unsqueeze(2), target_t, images) if mask_up is not None else target_t
+        target_t_masked = torch.where(mask_up.bool().unsqueeze(2), target_t, images_encoded) if mask_up is not None else target_t
         with torch.no_grad():
             for i in range(NFE):
                 t = t_steps[i]#.repeat(target_t.shape[0]) #t_steps_masked[i] 

@@ -33,6 +33,7 @@ class MnistSudokuGridDataset(Dataset):
         to_rgb: bool = True,
         download: bool = True,
         allow_synthetic_if_missing: bool = False,
+        repeat_factor: int = 1,
     ) -> None:
         super().__init__()
         self.root = Path(root)
@@ -43,6 +44,7 @@ class MnistSudokuGridDataset(Dataset):
         self.image_size = tuple(image_size) if image_size is not None else None
         self.to_rgb = to_rgb
         self.allow_synthetic_if_missing = allow_synthetic_if_missing
+        self.repeat_factor = max(int(repeat_factor), 1)
 
         # Load MNIST digits and pre-select the top-N per label using the ranking CSV.
         self.mnist_images = self._load_top_mnist_digits(download=download)
@@ -81,12 +83,12 @@ class MnistSudokuGridDataset(Dataset):
         )
 
     def __len__(self) -> int:
-        return len(self.sudoku_grids)
+        return len(self.sudoku_grids) * self.repeat_factor
 
     def __repr__(self) -> str:
         return (
             f"MnistSudokuGridDataset(split={self.split}, "
-            f"top_n={self.top_n}, len={len(self)})"
+            f"top_n={self.top_n}, len={len(self)}, repeat_factor={self.repeat_factor})"
         )
 
     def _load_top_mnist_digits(self, download: bool) -> torch.Tensor:
@@ -142,8 +144,9 @@ class MnistSudokuGridDataset(Dataset):
         return full_image
 
     def __getitem__(self, idx: int) -> dict:
-        grid = self.sudoku_grids[idx]
-        image = self._build_grid_image(grid, idx)
+        base_idx = idx % len(self.sudoku_grids)
+        grid = self.sudoku_grids[base_idx]
+        image = self._build_grid_image(grid, base_idx)
         # Convert to PIL for torchvision transforms.
         pil_img = to_pil_image(image)
         if self.to_rgb:

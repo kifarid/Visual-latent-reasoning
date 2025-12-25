@@ -6,7 +6,7 @@ model:
   grad_clip: 1.0
   precision: bf16
   grad_acc_steps: 1
-  target: models.second_stage.fm_recursive_images_debug.ModelSR
+  target: models.second_stage.fm_recursive_images_x.ModelSR
   params:
     # training
     warmup_steps: 500
@@ -21,7 +21,7 @@ model:
     tnk_loss_weight: 0.0
     loss_type: cos_sim
     ctx_noise_exp: 1.0
-    future_noise_exp: 0.5
+    future_noise_exp: 1.0
     # frame layout (single-frame generation)
     num_ctx_frames: 0
     num_pred_frames: 1

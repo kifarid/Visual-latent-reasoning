@@ -51,13 +51,13 @@ class DataModuleFromConfig(pl.LightningDataModule):
 
     def _train_dataloader(self):
         if self.dbg:
-            #prefetch_kwargs = {"prefetch_factor": 1} if self.num_workers and self.num_workers > 0 else {}
+            prefetch_kwargs = {"prefetch_factor": 2, "persistent_workers": True} if self.num_workers and self.num_workers > 0 else {}
             sampler = DistributedSampler(self.datasets["train"], shuffle=True) # if self.trainer.use_ddp else None
             return DataLoader(
                 self.datasets["train"],
                 batch_size=self.batch_size,
                 num_workers=self.num_workers,
-                #**prefetch_kwargs,
+                **prefetch_kwargs,
                 shuffle=False,
                 collate_fn=custom_collate,
                 pin_memory=True,
@@ -65,12 +65,12 @@ class DataModuleFromConfig(pl.LightningDataModule):
                 sampler=sampler,
             )
         else:
-            #prefetch_kwargs = {"prefetch_factor": 1} if self.num_workers and self.num_workers > 0 else {}
+            prefetch_kwargs = {"prefetch_factor": 2, "persistent_workers": True} if self.num_workers and self.num_workers > 0 else {}
             return DataLoader(
                 self.datasets["train"],
                 batch_size=self.batch_size,
                 num_workers=self.num_workers,
-                #**prefetch_kwargs,
+                **prefetch_kwargs,
                 shuffle=True,
                 #collate_fn=custom_collate,
                 pin_memory=True,
@@ -78,7 +78,7 @@ class DataModuleFromConfig(pl.LightningDataModule):
             )
 
     def _val_dataloader(self):
-        prefetch_kwargs = {"prefetch_factor": 1} if self.num_workers and self.num_workers > 0 else {}
+        prefetch_kwargs = {"prefetch_factor": 2, "persistent_workers": True} if self.num_workers and self.num_workers > 0 else {}
         return DataLoader(
             self.datasets["validation"],
             batch_size=self.val_batch_size,
@@ -90,7 +90,7 @@ class DataModuleFromConfig(pl.LightningDataModule):
         )
 
     def _test_dataloader(self):
-        prefetch_kwargs = {"prefetch_factor": 1} if self.num_workers and self.num_workers > 0 else {}
+        prefetch_kwargs = {"prefetch_factor": 2, "persistent_workers": True} if self.num_workers and self.num_workers > 0 else {}
         return DataLoader(
             self.datasets["test"],
             batch_size=self.val_batch_size,
